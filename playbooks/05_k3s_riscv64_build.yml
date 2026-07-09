@@ -1,0 +1,381 @@
+---
+# Builds k3s from source for riscv64 and runs it as a STANDALONE single-node
+# server. No official riscv64 k3s release exists, and the one community fork
+# (CARV-ICS-FORTH/k3s) is stale enough to be an unsupported Kubernetes
+# version skew - see docs/2026-07-09-k3s-riscv64-source-build.md for the
+# full investigation and the manual run this playbook automates.
+#
+# Per standing project constraint, this node is NOT joined to k8s-node-01 or
+# any multi-node cluster - that doc's validation goal (and this playbook's)
+# is a standalone single-node server only.
+- name: Build k3s from source for riscv64 and run standalone
+  hosts: k8s_nodes
+  become: true
+  vars:
+    k3s_user: "{{ ansible_user }}"
+    k3s_user_home: "/home/{{ k3s_user }}"
+    k3s_git_tag: v1.36.2+k3s1
+    k3s_repo_url: https://github.com/k3s-io/k3s.git
+    k3s_build_dir: "{{ k3s_user_home }}/k3s"
+    go_version: "1.26.2"
+    go_sdk_parent_dir: "{{ k3s_user_home }}/sdk"
+    go_sdk_dir: "{{ go_sdk_parent_dir }}/go"
+    yq_version: "v4.53.3"
+    pause_build_dir: "{{ k3s_user_home }}/pause-riscv64"
+    pause_version_tag: "3.10-riscv64-local"
+    k3s_pause_image: "localhost/pause:riscv64-local"
+    min_total_mem_mb: 4096
+    k3s_build_env:
+      ARCH: riscv64
+      GOARCH: riscv64
+      GIT_TAG: "{{ k3s_git_tag }}"
+      PATH: "{{ k3s_user_home }}/bin:{{ go_sdk_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    # node_hostname comes from host_vars/<hostname>.yml
+
+  tasks:
+    # --- Preconditions -----------------------------------------------------
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_architecture == "riscv64"
+        fail_msg: >-
+          This playbook builds a riscv64 k3s binary and will not produce
+          anything useful on {{ ansible_architecture }}. Target it
+          explicitly, e.g. --limit k8s-rv2-01.
+
+    - name: Abort if this board doesn't have enough RAM to attempt the build
+      ansible.builtin.assert:
+        that: ansible_memtotal_mb >= min_total_mem_mb
+        fail_msg: >-
+          Only {{ ansible_memtotal_mb }}MB total RAM detected, want at least
+          {{ min_total_mem_mb }}MB. The main k3s compile is memory-heavy
+          (see the reboot incident in
+          docs/2026-07-09-k3s-riscv64-source-build.md).
+
+    # --- Build prerequisites -------------------------------------------------
+    - name: Install apt build prerequisites
+      ansible.builtin.apt:
+        name:
+          - gcc
+          - make
+          - git
+          - zstd
+          - libsqlite3-dev
+          - libseccomp-dev
+          - libapparmor-dev
+          - pkg-config
+        state: present
+        update_cache: true
+
+    - name: Check for existing Go SDK installation
+      ansible.builtin.command: "{{ go_sdk_dir }}/bin/go version"
+      register: go_check
+      changed_when: false
+      failed_when: false
+      become: false
+
+    - name: Download Go for linux/riscv64
+      ansible.builtin.get_url:
+        url: "https://go.dev/dl/go{{ go_version }}.linux-riscv64.tar.gz"
+        dest: "/tmp/go{{ go_version }}.linux-riscv64.tar.gz"
+        mode: "0644"
+      become: false
+      when: go_version not in go_check.stdout
+
+    - name: Extract Go SDK (user-owned - no sudo needed for the rest of the build)
+      ansible.builtin.unarchive:
+        src: "/tmp/go{{ go_version }}.linux-riscv64.tar.gz"
+        dest: "{{ go_sdk_parent_dir }}"
+        remote_src: true
+      become: false
+      when: go_version not in go_check.stdout
+
+    - name: Check for existing mikefarah/yq installation
+      ansible.builtin.command: "{{ k3s_user_home }}/bin/yq --version"
+      register: yq_check
+      changed_when: false
+      failed_when: false
+      become: false
+
+    - name: Ensure ~/bin exists
+      ansible.builtin.file:
+        path: "{{ k3s_user_home }}/bin"
+        state: directory
+        mode: "0755"
+      become: false
+
+    # k3s's scripts/download needs mikefarah/yq v4 (`yq eval`). Debian's own
+    # `yq` apt package is a *different*, incompatible tool (kislyuk/yq, a
+    # Python/jq wrapper with no `eval` subcommand) - installing it would not
+    # fix this, hence fetching the binary directly instead.
+    - name: Download mikefarah/yq {{ yq_version }} (NOT the Debian yq package - see comment above)
+      ansible.builtin.get_url:
+        url: "https://github.com/mikefarah/yq/releases/download/{{ yq_version }}/yq_linux_riscv64"
+        dest: "{{ k3s_user_home }}/bin/yq"
+        mode: "0755"
+      become: false
+      when: yq_version not in yq_check.stdout
+
+    # --- Fetch and build k3s itself ------------------------------------------
+    - name: Clone k3s at the pinned tag
+      ansible.builtin.git:
+        repo: "{{ k3s_repo_url }}"
+        dest: "{{ k3s_build_dir }}"
+        version: "{{ k3s_git_tag }}"
+        depth: 1
+      become: false
+
+    - name: Run scripts/download (fetch k3s-root, clone containerd source, fetch helm charts)
+      ansible.builtin.command:
+        cmd: "sh -c './scripts/download > {{ k3s_user_home }}/k3s-download.log 2>&1'"
+        chdir: "{{ k3s_build_dir }}"
+        creates: "{{ k3s_build_dir }}/bin/busybox"
+      environment: "{{ k3s_build_env }}"
+      become: false
+      async: 1200
+      poll: 15
+
+    # The slow, memory-heavy step - crashed the board once via an unexplained
+    # reboot mid-compile (see docs/2026-07-09-k3s-riscv64-source-build.md).
+    # Logging to the home dir rather than /tmp specifically because /tmp did
+    # not survive that reboot, which hampered the postmortem.
+    - name: Run scripts/build (compiles CNI plugins, runc, containerd shim, and the k3s dev binary)
+      ansible.builtin.command:
+        cmd: "sh -c './scripts/build > {{ k3s_user_home }}/k3s-build.log 2>&1'"
+        chdir: "{{ k3s_build_dir }}"
+        creates: "{{ k3s_build_dir }}/bin/k3s"
+      environment: "{{ k3s_build_env }}"
+      become: false
+      async: 3600
+      poll: 30
+
+    # scripts/build's bin/k3s is a dev binary only - it expects its sibling
+    # CNI-plugin binaries as bare files that don't actually exist yet (only
+    # symlinks scripts/package-cli creates), and fails at pod-sandbox-creation
+    # time with "host-local: executable file not found in $PATH" if installed
+    # directly. This step produces the real, self-contained artifact.
+    - name: Run scripts/package-cli (produces the real, self-contained k3s-riscv64 artifact)
+      ansible.builtin.command:
+        cmd: "sh -c './scripts/package-cli > {{ k3s_user_home }}/k3s-package.log 2>&1'"
+        chdir: "{{ k3s_build_dir }}"
+        creates: "{{ k3s_build_dir }}/dist/artifacts/k3s-riscv64"
+      environment: "{{ k3s_build_env }}"
+      become: false
+      async: 900
+      poll: 15
+
+    - name: Verify the built artifact reports the expected version
+      ansible.builtin.command: "{{ k3s_build_dir }}/dist/artifacts/k3s-riscv64 --version"
+      register: k3s_version_check
+      changed_when: false
+      become: false
+
+    - name: Assert built binary matches the target git tag
+      ansible.builtin.assert:
+        that: k3s_git_tag in k3s_version_check.stdout
+        fail_msg: "Built k3s binary reports unexpected version: {{ k3s_version_check.stdout }}"
+
+    # --- Install and start k3s -----------------------------------------------
+    - name: Install packaged k3s binary to /usr/local/bin
+      ansible.builtin.copy:
+        remote_src: true
+        src: "{{ k3s_build_dir }}/dist/artifacts/k3s-riscv64"
+        dest: /usr/local/bin/k3s
+        owner: root
+        group: root
+        mode: "0755"
+      notify: restart k3s
+
+    - name: Install k3s systemd unit (verbatim from the built tree - no templating needed)
+      ansible.builtin.copy:
+        remote_src: true
+        src: "{{ k3s_build_dir }}/k3s.service"
+        dest: /etc/systemd/system/k3s.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: restart k3s
+
+    - name: Ensure k3s service is enabled and started
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Wait for k3s's embedded containerd socket
+      ansible.builtin.wait_for:
+        path: /run/k3s/containerd/containerd.sock
+        timeout: 120
+
+    # --- riscv64 pause image ---------------------------------------------
+    # No riscv64 build of any pause sandbox image exists anywhere upstream
+    # (checked rancher/mirrored-pause and registry.k8s.io/pause across
+    # several versions - see the source doc). Without this, every pod
+    # sandbox fails to create even though the node itself comes up Ready.
+    - name: Ensure pause build directory exists
+      ansible.builtin.file:
+        path: "{{ pause_build_dir }}"
+        state: directory
+        mode: "0755"
+      become: false
+
+    - name: Copy pause.c source to board
+      ansible.builtin.copy:
+        src: ../files/pause.c
+        dest: "{{ pause_build_dir }}/pause.c"
+        mode: "0644"
+      become: false
+
+    - name: Compile static riscv64 pause binary
+      ansible.builtin.command:
+        cmd: "gcc -Os -static -DVERSION={{ pause_version_tag }} -o pause pause.c"
+        chdir: "{{ pause_build_dir }}"
+        creates: "{{ pause_build_dir }}/pause"
+      become: false
+
+    - name: Copy OCI image builder script to board
+      ansible.builtin.copy:
+        src: ../files/build_pause_image.py
+        dest: "{{ pause_build_dir }}/build_pause_image.py"
+        mode: "0755"
+      become: false
+
+    - name: Check whether the pause image is already imported into k3s's containerd
+      ansible.builtin.command: >-
+        sh -c "k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images ls | grep -F {{ k3s_pause_image }} || true"
+      register: pause_image_check
+      changed_when: false
+
+    - name: Build the pause OCI image tarball
+      ansible.builtin.command:
+        cmd: "python3 build_pause_image.py pause {{ pause_build_dir }}/pause-riscv64.oci.tar {{ k3s_pause_image }}"
+        chdir: "{{ pause_build_dir }}"
+        creates: "{{ pause_build_dir }}/pause-riscv64.oci.tar"
+      become: false
+      when: pause_image_check.stdout == ""
+
+    - name: Import the pause image into k3s's containerd (no registry needed for single-node)
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images import {{ pause_build_dir }}/pause-riscv64.oci.tar
+      when: pause_image_check.stdout == ""
+
+    - name: Ensure /etc/rancher/k3s directory exists
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure k3s to use the riscv64 pause image
+      ansible.builtin.template:
+        src: ../templates/k3s-config.yaml.j2
+        dest: /etc/rancher/k3s/config.yaml
+        owner: root
+        group: root
+        mode: "0644"
+      notify: restart k3s
+
+    - name: Flush handlers so binary/unit/config changes take effect before validation
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for node to report Ready
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get node {{ node_hostname }} --no-headers
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: node_ready_check
+      until: "'Ready' in node_ready_check.stdout"
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    # k3s's bundled local-path-provisioner (used by any PVC with
+    # storageClassName: local-path) runs a helper pod to mkdir the hostPath
+    # directory, using rancher/mirrored-library-busybox by default - which,
+    # like rancher/mirrored-pause, has no riscv64 build (checked directly,
+    # same as the pause-image gap). Any PVC provisioning hangs/times out
+    # until this is repointed at an image that does support riscv64 (the
+    # Docker-official busybox does).
+    - name: Patch local-path-provisioner's helper pod to use a riscv64-capable busybox image
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n kube-system patch configmap local-path-config
+        --type merge -p
+        '{"data":{"helperPod.yaml":"apiVersion: v1\nkind: Pod\nmetadata:\n  name: helper-pod\nspec:\n  containers:\n  - name: helper-pod\n    image: \"busybox:1.37.0\"\n    imagePullPolicy: IfNotPresent\n"}}'
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: local_path_patch
+      changed_when: "'(no change)' not in local_path_patch.stdout"
+
+    - name: Restart local-path-provisioner to pick up the patched helper pod image
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n kube-system rollout restart deployment/local-path-provisioner
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      when: local_path_patch.changed
+      changed_when: true
+
+    # --- kubectl access for the login user, no sudo -------------------------
+    - name: Symlink kubectl to the k3s multi-call binary
+      ansible.builtin.file:
+        src: /usr/local/bin/k3s
+        dest: /usr/local/bin/kubectl
+        state: link
+
+    - name: Ensure {{ k3s_user }}'s ~/.kube directory exists
+      ansible.builtin.file:
+        path: "{{ k3s_user_home }}/.kube"
+        state: directory
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0700"
+
+    - name: Copy kubeconfig to {{ k3s_user }}'s home directory
+      ansible.builtin.copy:
+        remote_src: true
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "{{ k3s_user_home }}/.kube/config"
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0600"
+
+    # k3s's bundled kubectl ignores the standard ~/.kube/config default and
+    # falls back to /etc/rancher/k3s/k3s.yaml (root-only) unless $KUBECONFIG
+    # is set explicitly. Must go in ~/.profile, NOT ~/.bashrc - Debian's
+    # default ~/.bashrc starts with a non-interactive-shell guard that
+    # silently skips anything appended below it.
+    - name: Ensure KUBECONFIG is exported in {{ k3s_user }}'s ~/.profile
+      ansible.builtin.lineinfile:
+        path: "{{ k3s_user_home }}/.profile"
+        regexp: '^export KUBECONFIG='
+        line: "export KUBECONFIG=$HOME/.kube/config"
+      become: false
+
+    # --- Validation -----------------------------------------------------------
+    - name: Validate kubectl works for {{ k3s_user }} without sudo
+      ansible.builtin.command: /usr/local/bin/kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      register: kubectl_validation
+      changed_when: false
+
+    - name: Assert node is Ready and running the expected k3s version
+      ansible.builtin.assert:
+        that:
+          - "'Ready' in kubectl_validation.stdout"
+          - k3s_git_tag in kubectl_validation.stdout
+        fail_msg: "Node validation failed - got: {{ kubectl_validation.stdout }}"
+
+    - name: Report final cluster state for operator review
+      ansible.builtin.debug:
+        msg: "{{ kubectl_validation.stdout_lines }}"
+
+  handlers:
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: restarted

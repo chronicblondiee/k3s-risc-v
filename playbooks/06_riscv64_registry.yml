@@ -1,0 +1,141 @@
+---
+# Deploys a local OCI image registry on the riscv64 build host so images
+# built/imported there (starting with the hand-built `pause` image from
+# 05_k3s_riscv64_build.yml) don't need re-building by hand on every future
+# riscv64 node - they get pulled from this registry instead.
+#
+# registry:2.x has no riscv64 build; registry:3.0.0 (the CNCF Distribution
+# v3 rewrite) does - checked directly the same way the pause-image gap was
+# checked, not assumed. See docs/2026-07-09-k3s-riscv64-source-build.md for
+# that precedent.
+#
+# Runs as a pod on the standalone k3s server built by 05_k3s_riscv64_build.yml
+# (reuses the already-validated local-path-provisioner for storage), NOT as
+# a bare container - deliberately dogfoods the cluster this repo just spent
+# effort proving works, rather than adding a separate systemd service to
+# maintain. Per standing project constraint this does not join any nodes
+# together - it's a plain single-node pod exposed via NodePort on the LAN.
+- name: Deploy a local riscv64 OCI registry and configure containerd to use it
+  hosts: k8s_nodes
+  become: true
+  vars:
+    k3s_user: "{{ ansible_user }}"
+    k3s_user_home: "/home/{{ k3s_user }}"
+    registry_namespace: riscv64-registry
+    registry_image: "registry:3.0.0"
+    registry_storage_size: "4Gi"
+    registry_node_port: 30500
+    registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
+    k3s_pause_image_ref: "localhost/pause:riscv64-local"
+
+  tasks:
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_architecture == "riscv64"
+        fail_msg: >-
+          This registry is specifically for riscv64 image distribution.
+          Target it explicitly, e.g. --limit k8s-rv2-01.
+
+    # --- Point this node's own containerd at the registry (as mirror) --------
+    # An http:// endpoint here is what tells containerd this is a plain-HTTP
+    # registry (no TLS at all) - there's deliberately no cert/insecure-skip
+    # config, since there's no TLS in play to begin with for this home-lab
+    # registry.
+    - name: Configure k3s containerd to use the riscv64 registry as a mirror
+      ansible.builtin.template:
+        src: ../templates/k3s-registries.yaml.j2
+        dest: /etc/rancher/k3s/registries.yaml
+        owner: root
+        group: root
+        mode: "0644"
+      notify: restart k3s
+
+    - name: Flush handlers so registries.yaml takes effect before the registry pod is deployed
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for node to report Ready after any restart
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get node --no-headers
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: node_ready_check
+      until: "'Ready' in node_ready_check.stdout"
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    # --- Deploy the registry itself as a pod on this node's own k3s ----------
+    - name: Render riscv64 registry manifest
+      ansible.builtin.template:
+        src: ../templates/riscv64-registry.yaml.j2
+        dest: "{{ k3s_user_home }}/riscv64-registry.yaml"
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0644"
+      become: false
+      register: registry_manifest
+
+    - name: Apply riscv64 registry manifest
+      ansible.builtin.command: "kubectl apply -f {{ k3s_user_home }}/riscv64-registry.yaml"
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      register: registry_apply
+      changed_when: "'unchanged' not in registry_apply.stdout"
+
+    - name: Wait for registry deployment rollout
+      ansible.builtin.command: >-
+        kubectl -n {{ registry_namespace }} rollout status deployment/riscv64-registry --timeout=120s
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      changed_when: false
+
+    # --- Push what we've already built into it --------------------------------
+    - name: Check whether the pause image is already present in the registry
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/pause/tags/list"
+        status_code: [200, 404]
+      register: pause_registry_check
+
+    - name: Tag the local pause image for the registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images tag {{ k3s_pause_image_ref }} {{ registry_endpoint }}/pause:riscv64-local
+      when: pause_registry_check.status == 404
+      changed_when: true
+
+    - name: Push the pause image into the local registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images push --plain-http {{ registry_endpoint }}/pause:riscv64-local
+      when: pause_registry_check.status == 404
+      changed_when: true
+
+    # --- Prove the round trip actually works, not just that push succeeded ---
+    - name: Verify the registry serves back what was pushed
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/pause/tags/list"
+        return_content: true
+      register: pause_registry_verify
+
+    - name: Assert the pushed tag is visible in the registry catalog
+      ansible.builtin.assert:
+        that: "'riscv64-local' in pause_registry_verify.content"
+        fail_msg: "Registry does not report the pushed pause tag: {{ pause_registry_verify.content }}"
+
+    - name: Report registry endpoint for operator reference
+      ansible.builtin.debug:
+        msg: >-
+          riscv64 registry reachable at http://{{ registry_endpoint }} -
+          future riscv64 nodes should get the same
+          templates/k3s-registries.yaml.j2 config (this playbook, run
+          against them) to pull through it instead of rebuilding images by
+          hand.
+
+  handlers:
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: restarted

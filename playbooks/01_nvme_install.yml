@@ -1,0 +1,84 @@
+---
+# NOTE: Before trusting this play, do one manual interactive dry run first
+# (ssh <your_user>@<node_ip>, sudo armbian-install) and correct the `responses`
+# regexes/menu-tag numbers and yes/no defaults below against what's actually
+# shown. Treat the values here as a first draft, not verified truth.
+- name: Install running Armbian system from SD to NVMe (DESTRUCTIVE)
+  hosts: k8s_nodes
+  gather_facts: true
+  become: true
+  vars:
+    nvme_install_timeout: 1800
+
+  tasks:
+    - name: Pre-flight - confirm currently booted from SD, not already NVMe
+      ansible.builtin.command: findmnt -no SOURCE /
+      register: root_source
+      changed_when: false
+
+    - name: Abort if root is already on NVMe
+      ansible.builtin.fail:
+        msg: "Root is already on {{ root_source.stdout }}; refusing to re-run destructively."
+      when: "'nvme' in root_source.stdout"
+
+    - name: Detect NVMe device node
+      ansible.builtin.command: lsblk -ndo NAME -e7 -I 259,8,179
+      register: nvme_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Confirm NVMe device is visible
+      ansible.builtin.assert:
+        that: "'nvme0n1' in nvme_probe.stdout"
+        fail_msg: "/dev/nvme0n1 not detected - verify it's seated before continuing."
+
+    - name: Detect SPI/MTD flash presence (determines which install menu option to drive)
+      ansible.builtin.command: cat /proc/mtd
+      register: mtd_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Report MTD detection result for operator review
+      ansible.builtin.debug:
+        msg: >
+          MTD present: {{ mtd_probe.rc == 0 and mtd_probe.stdout != '' }}.
+          If false: STOP - tag 1 alone leaves /boot on the SD card, which does not
+          satisfy full NVMe boot. Re-verify hardware/Armbian SPI support first.
+
+    - name: Locate install tool (armbian-install, falling back to legacy name)
+      ansible.builtin.command: sh -c "command -v armbian-install || command -v nand-sata-install"
+      register: install_tool
+      changed_when: false
+
+    - name: Confirm target NVMe erase before proceeding
+      ansible.builtin.pause:
+        prompt: >
+          About to run {{ install_tool.stdout }} against /dev/nvme0n1 (WILL BE ERASED).
+          Root is currently on {{ root_source.stdout }}. Enter to continue, Ctrl+C then A to abort.
+
+    - name: Drive armbian-install interactively via expect (dialog-based TUI)
+      ansible.builtin.expect:
+        command: "{{ install_tool.stdout }}"
+        timeout: "{{ nvme_install_timeout }}"
+        echo: true
+        responses:
+          "Choose an option:": "4\n"
+          "Select the destination:": "1\n"
+          "Automated install will generate needed partition": "\n"
+          "Select filesystem type for": "1\n"
+          "This script will erase your device": "\n"
+          "Do you want to write the bootloader to MTD Flash": "\n"
+          "This script will update the bootloader on one or multiple of these MTD devices": "\n"
+      environment:
+        TERM: linux
+      register: install_result
+
+    - name: Show install tool output for manual review
+      ansible.builtin.debug:
+        var: install_result.stdout_lines
+
+    - name: Reboot after NVMe install
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        connect_timeout: 20
+        pre_reboot_delay: 5

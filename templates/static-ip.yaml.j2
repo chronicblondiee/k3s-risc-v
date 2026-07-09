@@ -1,0 +1,15 @@
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    {{ primary_iface }}:
+      addresses:
+        - {{ static_ip }}
+      routes:
+        - to: default
+          via: {{ gateway_ip }}
+      nameservers:
+        addresses:
+{% for ns in dns_servers %}
+          - {{ ns }}
+{% endfor %}

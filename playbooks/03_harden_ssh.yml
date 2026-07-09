@@ -1,0 +1,28 @@
+---
+- name: Harden SSH (run only after manually confirming key auth works)
+  hosts: k8s_nodes
+  become: true
+  tasks:
+    - name: Disable password authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication\s'
+        line: 'PasswordAuthentication no'
+      notify: restart sshd
+
+    - name: Disable root SSH login
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin\s'
+        line: 'PermitRootLogin no'
+      notify: restart sshd
+
+    - name: Validate sshd config before applying
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
+  handlers:
+    - name: restart sshd
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted

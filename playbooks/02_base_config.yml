@@ -1,0 +1,90 @@
+---
+- name: Base OS configuration on NVMe-booted node
+  hosts: k8s_nodes
+  become: true
+  vars:
+    dns_servers: [1.1.1.1, 9.9.9.9]
+    node_timezone: UTC
+    # node_hostname, static_ip, gateway_ip come from host_vars/<hostname>.yml
+
+  tasks:
+    - name: Set hostname
+      ansible.builtin.hostname:
+        name: "{{ node_hostname }}"
+
+    - name: Ensure /etc/hosts has matching entry
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1'
+        line: "127.0.1.1 {{ node_hostname }}"
+
+    - name: Detect primary interface (the one carrying the default route)
+      ansible.builtin.set_fact:
+        primary_iface: "{{ ansible_facts.default_ipv4.interface }}"
+
+    - name: Fail loudly if no default route interface was found
+      ansible.builtin.fail:
+        msg: >-
+          Could not determine the default-route interface from
+          ansible_facts.default_ipv4 - check networking manually before
+          proceeding rather than guessing.
+      when: not primary_iface
+
+    - name: Detect existing netplan config
+      ansible.builtin.command: sh -c "grep -rl renderer /etc/netplan/ || true"
+      register: netplan_probe
+      changed_when: false
+
+    - name: Fail loudly if no netplan config found
+      ansible.builtin.fail:
+        msg: "No /etc/netplan/*.yaml found - check systemd-networkd/NetworkManager manually before proceeding."
+      when: netplan_probe.stdout == ""
+
+    - name: Remove default DHCP netplan config
+      ansible.builtin.file:
+        path: /etc/netplan/10-dhcp-all-interfaces.yaml
+        state: absent
+      register: dhcp_removed
+
+    - name: Deploy static IP netplan config
+      ansible.builtin.template:
+        src: ../templates/static-ip.yaml.j2
+        dest: "/etc/netplan/20-{{ node_hostname }}-static.yaml"
+        owner: root
+        group: root
+        mode: "0600"
+      register: netplan_deployed
+
+    - name: Apply netplan
+      ansible.builtin.command: netplan apply
+      when: dhcp_removed.changed or netplan_deployed.changed
+      async: 45
+      poll: 0
+
+    - name: Wait for reconnect after netplan apply
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: 60
+      when: dhcp_removed.changed or netplan_deployed.changed
+
+    - name: Set timezone
+      ansible.builtin.timezone:
+        name: "{{ node_timezone }}"
+
+    - name: Update apt cache and upgrade all packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        cache_valid_time: 3600
+
+    - name: Rotate password for {{ ansible_user }}
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        password: "{{ vault_admin_password | password_hash('sha512') }}"
+        update_password: always
+
+    - name: Rotate password for root
+      ansible.builtin.user:
+        name: root
+        password: "{{ vault_root_password | password_hash('sha512') }}"
+        update_password: always

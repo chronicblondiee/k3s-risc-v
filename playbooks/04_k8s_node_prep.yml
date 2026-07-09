@@ -1,0 +1,102 @@
+---
+- name: Container runtime and Kubernetes node prerequisites
+  hosts: k8s_nodes
+  become: true
+  tasks:
+    - name: Check for active swap
+      ansible.builtin.command: swapon --show
+      register: swap_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check zram-config default settings
+      ansible.builtin.slurp:
+        src: /etc/default/armbian-zram-config
+      register: zram_conf
+      failed_when: false
+
+    - name: Report zram/swap state for operator review
+      ansible.builtin.debug:
+        msg: "swapon: '{{ swap_check.stdout }}'. armbian-zram-config present: {{ zram_conf.content is defined }}."
+
+    - name: Disable any active swap
+      ansible.builtin.command: swapoff -a
+      when: swap_check.stdout != ""
+      changed_when: swap_check.stdout != ""
+
+    - name: Disable zram swap specifically if armbian-zram-config manages it
+      ansible.builtin.lineinfile:
+        path: /etc/default/armbian-zram-config
+        regexp: '^SWAP='
+        line: 'SWAP=false'
+      when: zram_conf.content is defined
+      notify: restart armbian-zram-config
+
+    - name: Comment out swap entries in fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    - name: Persist required kernel modules
+      ansible.builtin.copy:
+        content: |
+          overlay
+          br_netfilter
+        dest: /etc/modules-load.d/k8s.conf
+        mode: "0644"
+
+    - name: Load kernel modules now
+      ansible.builtin.command: "modprobe {{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+      changed_when: true
+
+    - name: Set required sysctls for Kubernetes networking
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/99-kubernetes-cri.conf
+        reload: true
+      loop:
+        - { name: net.bridge.bridge-nf-call-iptables, value: "1" }
+        - { name: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+        - { name: net.ipv4.ip_forward, value: "1" }
+
+    - name: Install containerd from distro apt repo
+      ansible.builtin.apt:
+        name: containerd
+        state: present
+        update_cache: true
+
+    - name: Generate default containerd config
+      ansible.builtin.command: containerd config default
+      register: containerd_default_config
+      changed_when: false
+
+    - name: Write containerd config with SystemdCgroup enabled
+      ansible.builtin.copy:
+        content: "{{ containerd_default_config.stdout | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true') }}"
+        dest: /etc/containerd/config.toml
+        owner: root
+        group: root
+        mode: "0644"
+      notify: restart containerd
+
+    - name: Ensure containerd is enabled and running
+      ansible.builtin.systemd:
+        name: containerd
+        enabled: true
+        state: started
+
+  handlers:
+    - name: restart armbian-zram-config
+      ansible.builtin.systemd:
+        name: armbian-zram-config
+        state: restarted
+
+    - name: restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted

@@ -1,0 +1,14 @@
+group_vars/all/vault.yml
+*.retry
+.vault_pass
+log/
+tools/rkdeveloptool/
+tools/rkbin/
+inventory.ini
+host_vars/*.yml
+.claude/
+id_rsa*
+id_ed25519*
+*.pem
+*.key
+known_hosts
