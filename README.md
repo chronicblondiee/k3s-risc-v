@@ -61,6 +61,19 @@ Then run the playbooks in order (`00` through `06`, skipping any that don't
 apply to your hardware) — see `AGENTS.md` for what each one does and the
 node-specific gotchas encountered along the way.
 
+Playbooks that need `become` (sudo) — e.g. the password-rotation tasks in
+`02_base_config.yml` — normally prompt interactively via
+`--ask-become-pass`. To avoid retyping it every run, copy `.env.example` to
+`.env` (gitignored), fill in `ANSIBLE_BECOME_PASSWORD`, then:
+
+```bash
+set -a; source .env; set +a
+ansible-playbook playbooks/02_base_config.yml --limit <host>
+```
+
+`group_vars/all/local.yml` picks this up automatically; if unset, normal
+prompting behavior is unaffected.
+
 ## License
 
 [MIT](LICENSE)

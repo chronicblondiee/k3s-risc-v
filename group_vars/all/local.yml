@@ -1,0 +1,9 @@
+---
+# Lets become-requiring playbook runs (e.g. playbooks/02_base_config.yml's
+# password rotation tasks) pick up the sudo password from the environment
+# instead of needing --ask-become-pass interactively every time. Populate
+# ANSIBLE_BECOME_PASSWORD in a local .env (gitignored, see .env.example)
+# and `set -a; source .env; set +a` before running ansible-playbook. If
+# unset, this evaluates to omit and normal --ask-become-pass/prompting
+# behavior is unaffected.
+ansible_become_password: "{{ lookup('env', 'ANSIBLE_BECOME_PASSWORD') | default(omit, true) }}"

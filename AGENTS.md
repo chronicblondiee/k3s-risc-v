@@ -159,7 +159,9 @@ working state, kept for reference.
 ansible.cfg, requirements.yml                  - Ansible project config
 inventory.ini.example                          - copy to inventory.ini (gitignored) with your own host/IP/user
 group_vars/all/vault.yml.example               - copy to vault.yml (gitignored), ansible-vault encrypt
+group_vars/all/local.yml                       - wires ANSIBLE_BECOME_PASSWORD env var to become password (see .env.example)
 host_vars/<hostname>.yml.example               - copy to <hostname>.yml (gitignored) with your own static IP/gateway
+.env.example                                   - copy to .env (gitignored), set ANSIBLE_BECOME_PASSWORD to skip --ask-become-pass
 playbooks/00-04_*.yml                          - see plan doc below for the intended sequence
 playbooks/05_k3s_riscv64_build.yml             - build+install k3s from source on k8s-rv2-01, riscv64-only
 playbooks/06_riscv64_registry.yml              - local OCI registry on k8s-rv2-01 for riscv64 image distribution
