@@ -1,1 +1,4 @@
 pause-image: {{ k3s_pause_image }}
+{% if k3s_helm_job_image is defined %}
+helm-job-image: {{ k3s_helm_job_image }}
+{% endif %}

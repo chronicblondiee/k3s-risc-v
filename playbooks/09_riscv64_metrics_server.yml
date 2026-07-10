@@ -1,0 +1,214 @@
+---
+# k3s's bundled metrics-server addon (a plain static manifest applied by
+# k3s's deploy-controller, not a HelmChart) references
+# rancher/mirrored-metrics-server:v0.8.1, which has no riscv64 build
+# (checked directly against registry.k8s.io's manifest list:
+# amd64/arm/arm64/ppc64le/s390x only, same check discipline as the
+# pause-image gap).
+#
+# metrics-server itself is a single CGO_ENABLED=0 Go binary (checked its
+# Makefile/Dockerfile directly - its own release Dockerfile's final stage
+# is gcr.io/distroless/static, which also has no riscv64 build, so that
+# stage isn't reusable either) - built natively here with the same Go
+# 1.26.2 riscv64 toolchain playbooks/05_k3s_riscv64_build.yml already
+# installed, then wrapped as a minimal OCI image with
+# files/build_static_binary_image.py (the same pattern as the pause image,
+# generalized - see that script's docstring).
+#
+# Pushed to the local registry under the image's EXACT original
+# repository path/tag so the docker.io mirror-with-fallback (enabled by
+# playbooks/08_riscv64_klipper_lb.yml) serves it automatically - no
+# fragile live "kubectl set image" patch needed, and it survives k3s
+# re-applying its bundled static manifest (same image ref either way).
+- name: Build a riscv64 metrics-server image
+  hosts: k8s_nodes
+  become: true
+  vars:
+    k3s_user: "{{ ansible_user }}"
+    k3s_user_home: "/home/{{ k3s_user }}"
+    go_sdk_dir: "{{ k3s_user_home }}/sdk/go"
+    registry_node_port: 30500
+    registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
+    # Must match the metrics-server image tag k3s's bundled addon manifest
+    # actually references (check: kubectl -n kube-system get deploy
+    # metrics-server -o jsonpath='{.spec.template.spec.containers[0].image}').
+    metrics_server_git_tag: v0.8.1
+    metrics_server_repo_url: https://github.com/kubernetes-sigs/metrics-server.git
+    metrics_server_build_dir: "{{ k3s_user_home }}/metrics-server-src"
+    metrics_server_image_ref: "localhost/metrics-server:{{ metrics_server_git_tag }}"
+    # Exact original path/tag - required for the docker.io mirror to serve
+    # this in place of the missing upstream image.
+    metrics_server_registry_ref: "{{ registry_endpoint }}/rancher/mirrored-metrics-server:{{ metrics_server_git_tag }}"
+
+  tasks:
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_architecture == "riscv64"
+        fail_msg: >-
+          This playbook builds a riscv64 metrics-server image and will not
+          produce anything useful on {{ ansible_architecture }}. Target it
+          explicitly, e.g. --limit k8s-rv2-01.
+
+    - name: Check whether the metrics-server image is already present in the registry
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/rancher/mirrored-metrics-server/tags/list"
+        status_code: [200, 404]
+      register: metrics_server_registry_check
+
+    - name: Verify the riscv64 Go SDK from the k3s build is present
+      ansible.builtin.command: "{{ go_sdk_dir }}/bin/go version"
+      changed_when: false
+      when: metrics_server_registry_check.status == 404
+
+    - name: Clone metrics-server at the tag matching k3s's referenced image
+      ansible.builtin.git:
+        repo: "{{ metrics_server_repo_url }}"
+        dest: "{{ metrics_server_build_dir }}"
+        version: "{{ metrics_server_git_tag }}"
+        depth: 1
+      become: false
+      when: metrics_server_registry_check.status == 404
+
+    - name: Get the checked-out commit for version ldflags
+      ansible.builtin.command: git rev-parse HEAD
+      args:
+        chdir: "{{ metrics_server_build_dir }}"
+      become: false
+      register: metrics_server_git_commit
+      changed_when: false
+      when: metrics_server_registry_check.status == 404
+
+    - name: Build the riscv64 metrics-server binary
+      ansible.builtin.command:
+        cmd: >-
+          go build -mod=readonly -trimpath
+          -ldflags "-w -X k8s.io/client-go/pkg/version.gitVersion={{ metrics_server_git_tag }}
+          -X k8s.io/client-go/pkg/version.gitCommit={{ metrics_server_git_commit.stdout }}"
+          -o metrics-server sigs.k8s.io/metrics-server/cmd/metrics-server
+        chdir: "{{ metrics_server_build_dir }}"
+        creates: "{{ metrics_server_build_dir }}/metrics-server"
+      environment:
+        GOARCH: riscv64
+        GOOS: linux
+        CGO_ENABLED: "0"
+        PATH: "{{ go_sdk_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      become: false
+      when: metrics_server_registry_check.status == 404
+
+    - name: Copy the OCI image builder script to the board
+      ansible.builtin.copy:
+        src: ../files/build_static_binary_image.py
+        dest: "{{ metrics_server_build_dir }}/build_static_binary_image.py"
+        mode: "0755"
+      become: false
+      when: metrics_server_registry_check.status == 404
+
+    - name: Build the metrics-server OCI image tarball
+      ansible.builtin.command:
+        cmd: >-
+          python3 build_static_binary_image.py metrics-server /metrics-server
+          metrics-server-riscv64.oci.tar {{ metrics_server_image_ref }}
+        chdir: "{{ metrics_server_build_dir }}"
+        creates: "{{ metrics_server_build_dir }}/metrics-server-riscv64.oci.tar"
+      become: false
+      when: metrics_server_registry_check.status == 404
+
+    - name: Import the image into k3s's containerd
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images import {{ metrics_server_build_dir }}/metrics-server-riscv64.oci.tar
+      when: metrics_server_registry_check.status == 404
+      changed_when: true
+
+    - name: Tag the image under its original repository path for the registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images tag {{ metrics_server_image_ref }} {{ metrics_server_registry_ref }}
+      when: metrics_server_registry_check.status == 404
+      changed_when: true
+
+    - name: Push the image into the local registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images push --plain-http {{ metrics_server_registry_ref }}
+      when: metrics_server_registry_check.status == 404
+      changed_when: true
+
+    - name: Verify the registry serves back what was pushed
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/rancher/mirrored-metrics-server/tags/list"
+        return_content: true
+      register: metrics_server_registry_verify
+
+    - name: Assert the pushed tag is visible in the registry catalog
+      ansible.builtin.assert:
+        that: "metrics_server_git_tag in metrics_server_registry_verify.content"
+        fail_msg: "Registry does not report the pushed metrics-server tag: {{ metrics_server_registry_verify.content }}"
+
+    # --- Ensure the docker.io mirror-with-fallback is enabled -------------
+    # Idempotent no-op if playbooks/08_riscv64_klipper_lb.yml already ran;
+    # self-contained if this playbook is run standalone.
+    - name: Configure containerd with the docker.io mirror-with-fallback
+      ansible.builtin.template:
+        src: ../templates/k3s-registries.yaml.j2
+        dest: /etc/rancher/k3s/registries.yaml
+        owner: root
+        group: root
+        mode: "0644"
+      vars:
+        mirror_docker_io: true
+      notify: restart k3s
+
+    - name: Flush handlers so the mirror config takes effect before validation
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for node to report Ready after any restart
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get node --no-headers
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: node_ready_check
+      until: "'Ready' in node_ready_check.stdout"
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    # --- Validation ---------------------------------------------------------
+    - name: Delete any existing metrics-server pod so it gets recreated with a fresh pull
+      ansible.builtin.command: >-
+        k3s kubectl -n kube-system delete pod -l k8s-app=metrics-server --ignore-not-found
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      changed_when: true
+
+    - name: Wait for the metrics-server pod to be Running
+      ansible.builtin.command: >-
+        k3s kubectl -n kube-system get pods -l k8s-app=metrics-server -o jsonpath={.items[*].status.phase}
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: metrics_server_pod_check
+      until: "'Running' in metrics_server_pod_check.stdout"
+      retries: 24
+      delay: 10
+      changed_when: false
+
+    - name: Wait for kubectl top nodes to return data
+      ansible.builtin.command: k3s kubectl top nodes --no-headers
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: top_nodes_check
+      until: top_nodes_check.rc == 0
+      retries: 12
+      delay: 10
+      changed_when: false
+
+    - name: Report final metrics-server state for operator review
+      ansible.builtin.debug:
+        msg: "{{ top_nodes_check.stdout_lines }}"
+
+  handlers:
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: restarted

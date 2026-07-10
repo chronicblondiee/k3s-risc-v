@@ -53,8 +53,11 @@ playbooks/03_harden_ssh.yml                    - disable password auth and root 
 playbooks/04_k8s_node_prep.yml                 - containerd/kubeadm-style node prep (needs review before use, see AGENTS.md)
 playbooks/05_k3s_riscv64_build.yml             - build+install k3s from source on the riscv64 node, standalone
 playbooks/06_riscv64_registry.yml              - local OCI registry for riscv64 image distribution
+playbooks/07_riscv64_klipper_helm.yml          - rebuild rancher/klipper-helm for riscv64 (unblocks Traefik's helm-install jobs)
+playbooks/08_riscv64_klipper_lb.yml            - rebuild rancher/klipper-lb for riscv64 (unblocks svclb-* ServiceLB pods); also enables the docker.io mirror-with-fallback
+playbooks/09_riscv64_metrics_server.yml        - rebuild metrics-server for riscv64
 templates/                                     - Jinja2 templates rendered by the playbooks above
-files/                                         - static assets (e.g. the hand-built riscv64 pause image source)
+files/                                         - static assets (hand-built riscv64 pause image source, generalized single-binary OCI image builder)
 tools/                                         - hardware-recovery build scripts (RK3588 Maskrom recovery)
 docs/                                          - incident logs / troubleshooting runbooks
 ```
@@ -144,8 +147,17 @@ including which operations are treated as destructive/hard-to-reverse
 - `playbooks/06_riscv64_registry.yml` doesn't yet distinguish "the node
   hosting the registry" from "a node that should just consume it" — needs
   a small fix before a second riscv64 node is onboarded.
-- `traefik`/`metrics-server` don't have riscv64 builds upstream and
-  haven't been worked around yet (nothing currently needs them).
+- `traefik` and `metrics-server` are now working on riscv64 — see
+  `docs/2026-07-10-riscv64-traefik-metrics-server-fix.md`.
+  `rancher/klipper-helm` (blocks Traefik's helm-install jobs) and
+  `rancher/klipper-lb` (blocks any `LoadBalancer`-Service ServiceLB pod,
+  including Traefik's) had no riscv64 builds upstream either and are now
+  rebuilt via `playbooks/07_riscv64_klipper_helm.yml` and
+  `playbooks/08_riscv64_klipper_lb.yml`; `metrics-server` itself
+  (`playbooks/09_riscv64_metrics_server.yml`) likewise. Pre-built riscv64
+  artifacts for all of these (plus k3s and pause) are published at
+  [releases/riscv64-v1.36.2-k3s1](https://github.com/chronicblondiee/k3s-risc-v/releases/tag/riscv64-v1.36.2-k3s1)
+  for quick re-provisioning without repeating the from-source builds.
 
 ## License
 

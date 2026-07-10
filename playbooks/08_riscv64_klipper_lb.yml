@@ -1,0 +1,190 @@
+---
+# k3s's ServiceLB controller creates a svclb-* DaemonSet pod for any
+# LoadBalancer-type Service (Traefik's default Service is one) using a
+# hardcoded image reference (pkg/cloudprovider/servicelb.go's
+# DefaultLBImage) - rancher/klipper-lb, which has no riscv64 build
+# (checked directly against Docker Hub's manifest list: amd64/arm/arm64
+# only). Unlike pause-image/helm-job-image, there's no k3s server flag to
+# override just this one image - the only built-in mechanism is
+# --system-default-registry, which isn't safe to use here since it
+# unconditionally prefixes ALL system images with no fallback (would
+# break coredns/local-path-provisioner, which already pull fine).
+#
+# Fixed instead via a containerd-level registry mirror (see
+# templates/k3s-registries.yaml.j2's mirror_docker_io block): redirect
+# docker.io pulls through our local registry first, falling back to the
+# real docker.io for anything not explicitly fixed there. For that to
+# work, our riscv64 build must be pushed under the EXACT original
+# repository path/tag (rancher/klipper-lb:v0.4.17), not a custom name.
+#
+# klipper-lb itself needs no source compilation at all - it's just
+# alpine:3.23 (which does have a riscv64 build) plus a handful of apk
+# packages (iptables/nftables) and a shell script, checked directly
+# against the upstream Dockerfile.
+- name: Build a riscv64 klipper-lb image and unblock ServiceLB pods
+  hosts: k8s_nodes
+  become: true
+  vars:
+    k3s_user: "{{ ansible_user }}"
+    k3s_user_home: "/home/{{ k3s_user }}"
+    registry_node_port: 30500
+    registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
+    # Must match the klipper-lb image tag k3s's ServiceLB controller
+    # actually references (check: kubectl -n kube-system get pod -l
+    # app=svclb-traefik -o jsonpath='{.items[0].spec.containers[0].image}'
+    # or grep DefaultLBImage in the k3s source tree at k3s_git_tag).
+    klipper_lb_git_tag: v0.4.17
+    klipper_lb_repo_url: https://github.com/k3s-io/klipper-lb.git
+    klipper_lb_build_dir: "{{ k3s_user_home }}/klipper-lb-src"
+    klipper_lb_image_ref: "localhost/klipper-lb:{{ klipper_lb_git_tag }}"
+    # Exact original path/tag - required for the docker.io mirror to serve
+    # this in place of the missing upstream image (see template comment).
+    klipper_lb_registry_ref: "{{ registry_endpoint }}/rancher/klipper-lb:{{ klipper_lb_git_tag }}"
+
+  tasks:
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_architecture == "riscv64"
+        fail_msg: >-
+          This playbook builds a riscv64 klipper-lb image and will not
+          produce anything useful on {{ ansible_architecture }}. Target it
+          explicitly, e.g. --limit k8s-rv2-01.
+
+    - name: Check whether the klipper-lb image is already present in the registry
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/rancher/klipper-lb/tags/list"
+        status_code: [200, 404]
+      register: klipper_lb_registry_check
+
+    - name: Install buildah and its container-networking/OCI-runtime helpers
+      ansible.builtin.apt:
+        name:
+          - buildah
+          - netavark
+          - crun
+          - nftables
+        state: present
+        update_cache: true
+      when: klipper_lb_registry_check.status == 404
+
+    - name: Clone klipper-lb at the tag matching k3s's referenced image
+      ansible.builtin.git:
+        repo: "{{ klipper_lb_repo_url }}"
+        dest: "{{ klipper_lb_build_dir }}"
+        version: "{{ klipper_lb_git_tag }}"
+        depth: 1
+        force: true
+      become: false
+      when: klipper_lb_registry_check.status == 404
+
+    - name: Build the riscv64 klipper-lb image with buildah
+      ansible.builtin.command:
+        cmd: "buildah bud -t {{ klipper_lb_image_ref }} ."
+        chdir: "{{ klipper_lb_build_dir }}"
+      when: klipper_lb_registry_check.status == 404
+      changed_when: true
+
+    - name: Export the built image to an OCI archive
+      ansible.builtin.command:
+        cmd: >-
+          buildah push {{ klipper_lb_image_ref }}
+          oci-archive:{{ klipper_lb_build_dir }}/klipper-lb-riscv64.oci.tar:{{ klipper_lb_image_ref }}
+      when: klipper_lb_registry_check.status == 404
+      changed_when: true
+
+    - name: Import the image into k3s's containerd
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images import {{ klipper_lb_build_dir }}/klipper-lb-riscv64.oci.tar
+      when: klipper_lb_registry_check.status == 404
+      changed_when: true
+
+    - name: Tag the image under its original repository path for the registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images tag {{ klipper_lb_image_ref }} {{ klipper_lb_registry_ref }}
+      when: klipper_lb_registry_check.status == 404
+      changed_when: true
+
+    - name: Push the image into the local registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images push --plain-http {{ klipper_lb_registry_ref }}
+      when: klipper_lb_registry_check.status == 404
+      changed_when: true
+
+    - name: Verify the registry serves back what was pushed
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/rancher/klipper-lb/tags/list"
+        return_content: true
+      register: klipper_lb_registry_verify
+
+    - name: Assert the pushed tag is visible in the registry catalog
+      ansible.builtin.assert:
+        that: "klipper_lb_git_tag in klipper_lb_registry_verify.content"
+        fail_msg: "Registry does not report the pushed klipper-lb tag: {{ klipper_lb_registry_verify.content }}"
+
+    # --- Enable the docker.io mirror-with-fallback ------------------------
+    - name: Configure containerd with the docker.io mirror-with-fallback
+      ansible.builtin.template:
+        src: ../templates/k3s-registries.yaml.j2
+        dest: /etc/rancher/k3s/registries.yaml
+        owner: root
+        group: root
+        mode: "0644"
+      vars:
+        mirror_docker_io: true
+      notify: restart k3s
+
+    - name: Flush handlers so the mirror config takes effect before validation
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for node to report Ready after restart
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get node --no-headers
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: node_ready_check
+      until: "'Ready' in node_ready_check.stdout"
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    # --- Validation ---------------------------------------------------------
+    - name: Delete any existing svclb pods so they get recreated with a fresh pull
+      ansible.builtin.shell: >-
+        k3s kubectl -n kube-system delete pod -l svccontroller.k3s.cattle.io/svcname
+        --ignore-not-found
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      changed_when: true
+
+    - name: Wait for svclb pods to be Running
+      ansible.builtin.shell: >-
+        k3s kubectl -n kube-system get pods -l svccontroller.k3s.cattle.io/svcname
+        -o jsonpath='{.items[*].status.phase}'
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: svclb_pod_check
+      until: "svclb_pod_check.stdout != '' and 'Pending' not in svclb_pod_check.stdout and 'Failed' not in svclb_pod_check.stdout"
+      retries: 24
+      delay: 10
+      changed_when: false
+
+    - name: Report final svclb state for operator review
+      ansible.builtin.command: k3s kubectl -n kube-system get pods -l svccontroller.k3s.cattle.io/svcname -o wide
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: svclb_final_state
+      changed_when: false
+
+    - name: Show svclb pod state
+      ansible.builtin.debug:
+        msg: "{{ svclb_final_state.stdout_lines }}"
+
+  handlers:
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: restarted

@@ -2,3 +2,22 @@ mirrors:
   "{{ registry_endpoint }}":
     endpoint:
       - "http://{{ registry_endpoint }}"
+{% if mirror_docker_io | default(false) %}
+  # Some rancher/* system images k3s references internally (klipper-lb,
+  # potentially others) have no dedicated k3s server flag to override
+  # their image ref, unlike pause-image/helm-job-image - and
+  # --system-default-registry isn't safe to use for this because it
+  # unconditionally prefixes ALL system images (including ones that
+  # already pull fine, like coredns) with no fallback if we haven't
+  # mirrored them too. This containerd-level mirror is scoped correctly
+  # instead: try our local registry first for anything under docker.io,
+  # fall through to the real docker.io for everything we haven't
+  # explicitly pushed a riscv64 build of. Images we fix this way must be
+  # pushed to our registry under their EXACT original repository path/tag
+  # (e.g. "rancher/klipper-lb:v0.4.17", not a custom name) - containerd's
+  # mirror substitutes only the host, not the path.
+  "docker.io":
+    endpoint:
+      - "http://{{ registry_endpoint }}"
+      - "https://registry-1.docker.io"
+{% endif %}

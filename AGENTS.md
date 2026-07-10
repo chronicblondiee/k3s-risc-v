@@ -139,6 +139,27 @@ working state, kept for reference.
   as-is would deploy a second independent registry, not point that node
   at this one; needs a small fix before a second riscv64 node is actually
   onboarded. Full detail in `docs/2026-07-10-riscv64-local-registry.md`.
+- **Traefik / ServiceLB / metrics-server:** all three were previously
+  ImagePullBackOff on this board with no riscv64 build upstream — now
+  fixed. `rancher/klipper-helm` (blocked Traefik's helm-install Jobs
+  before Traefik's own image was ever reached) and `rancher/klipper-lb`
+  (blocked `svclb-*` ServiceLB pods for any `LoadBalancer` Service,
+  including Traefik's) are rebuilt via `playbooks/07_riscv64_klipper_helm.yml`
+  and `playbooks/08_riscv64_klipper_lb.yml`; `klipper-lb` specifically
+  required introducing a containerd-level `docker.io` mirror-with-fallback
+  (see `templates/k3s-registries.yaml.j2`) since k3s has no dedicated
+  override flag for it, unlike `pause-image`/`helm-job-image`.
+  `metrics-server` (`playbooks/09_riscv64_metrics_server.yml`) is rebuilt
+  the same way as `pause` (native Go build + `files/build_static_binary_image.py`,
+  a generalization of `files/build_pause_image.py`) and pushed under its
+  exact original image path so the same mirror serves it. Full detail,
+  including the three-tools-deep `buildah` dependency chain
+  (`netavark`/`crun`/`nftables`, none installed by default) and the
+  bugs found rebuilding k3s on a freshly reflashed board (missing SDK
+  directory, `/tmp` as undersized `tmpfs`), in
+  `docs/2026-07-10-riscv64-traefik-metrics-server-fix.md`. Pre-built
+  artifacts published at
+  [releases/riscv64-v1.36.2-k3s1](https://github.com/chronicblondiee/k3s-risc-v/releases/tag/riscv64-v1.36.2-k3s1).
 - **`kubectl` access:** works directly as the admin user, no sudo, from a normal
   interactive SSH login (`kubectl get nodes`, etc.) — `/usr/local/bin/kubectl`
   is a symlink to the multi-call `k3s` binary, and `~/.kube/config` is a

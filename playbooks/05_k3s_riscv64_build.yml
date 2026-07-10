@@ -25,11 +25,20 @@
     pause_version_tag: "3.10-riscv64-local"
     k3s_pause_image: "localhost/pause:riscv64-local"
     min_total_mem_mb: 4096
+    go_build_tmp_dir: "{{ k3s_user_home }}/go-tmp"
     k3s_build_env:
       ARCH: riscv64
       GOARCH: riscv64
       GIT_TAG: "{{ k3s_git_tag }}"
       PATH: "{{ k3s_user_home }}/bin:{{ go_sdk_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      # /tmp on this board's default Armbian image is tmpfs (RAM-backed,
+      # ~half of total RAM) - go build's scratch dir ($WORK, under
+      # /tmp/go-build*) fills it building all of Kubernetes's packages and
+      # fails with "no space left on device" well before the disk itself is
+      # anywhere near full. Redirect Go's build temp dir to the real
+      # (ext4/SD-card) root filesystem instead.
+      TMPDIR: "{{ go_build_tmp_dir }}"
+      GOTMPDIR: "{{ go_build_tmp_dir }}"
     # node_hostname comes from host_vars/<hostname>.yml
 
   tasks:
@@ -81,6 +90,14 @@
       become: false
       when: go_version not in go_check.stdout
 
+    - name: Ensure Go SDK parent directory exists
+      ansible.builtin.file:
+        path: "{{ go_sdk_parent_dir }}"
+        state: directory
+        mode: "0755"
+      become: false
+      when: go_version not in go_check.stdout
+
     - name: Extract Go SDK (user-owned - no sudo needed for the rest of the build)
       ansible.builtin.unarchive:
         src: "/tmp/go{{ go_version }}.linux-riscv64.tar.gz"
@@ -116,6 +133,13 @@
       when: yq_version not in yq_check.stdout
 
     # --- Fetch and build k3s itself ------------------------------------------
+    - name: Ensure Go build temp directory exists on real disk (not tmpfs /tmp)
+      ansible.builtin.file:
+        path: "{{ go_build_tmp_dir }}"
+        state: directory
+        mode: "0755"
+      become: false
+
     - name: Clone k3s at the pinned tag
       ansible.builtin.git:
         repo: "{{ k3s_repo_url }}"

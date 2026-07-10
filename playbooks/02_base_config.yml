@@ -82,9 +82,11 @@
         name: "{{ ansible_user }}"
         password: "{{ vault_admin_password | password_hash('sha512') }}"
         update_password: always
+      tags: [password_rotation]
 
     - name: Rotate password for root
       ansible.builtin.user:
         name: root
         password: "{{ vault_root_password | password_hash('sha512') }}"
         update_password: always
+      tags: [password_rotation]

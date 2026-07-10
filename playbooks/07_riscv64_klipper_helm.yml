@@ -1,0 +1,232 @@
+---
+# k3s's helm-controller installs Traefik (and any other HelmChart CR) by
+# running a Job with rancher/klipper-helm - which has no riscv64 build
+# (checked directly against Docker Hub's manifest list: amd64/arm/arm64
+# only, same check discipline as the pause-image gap in
+# playbooks/05_k3s_riscv64_build.yml). This blocks Traefik before it even
+# gets to pulling its own image - and Traefik's actual image
+# (docker.io/library/traefik) DOES publish riscv64, so this is the only
+# fix needed to unblock it.
+#
+# Builds a riscv64 klipper-helm image from the real upstream source
+# (k3s-io/klipper-helm, pinned to the exact tag the running k3s build
+# references) via buildah, natively on the board - same "build on-device"
+# philosophy as playbooks/05/06. The upstream Dockerfile needs two small
+# patches to work on riscv64:
+#   1. its GOARCH case statement doesn't have a riscv64 branch (checked
+#      directly against the Dockerfile at the pinned tag)
+#   2. its helm-source-clone stage is FROM alpine/git, which itself has no
+#      riscv64 build (checked the same way) - swapped for plain alpine +
+#      `apk add git`, since that stage only needs `git clone`.
+- name: Build a riscv64 klipper-helm image and unblock Traefik's helm-install jobs
+  hosts: k8s_nodes
+  become: true
+  vars:
+    k3s_user: "{{ ansible_user }}"
+    k3s_user_home: "/home/{{ k3s_user }}"
+    registry_node_port: 30500
+    registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
+    # Must match the klipper-helm image tag k3s's helm-controller actually
+    # references (check: kubectl -n kube-system get pod -l job-name=helm-install-traefik
+    # -o jsonpath='{.items[0].spec.containers[0].image}') - it's pinned to
+    # whatever k3s v1.36.2+k3s1 bundles, not necessarily klipper-helm's latest tag.
+    klipper_helm_git_tag: v0.11.1-build20260615
+    klipper_helm_repo_url: https://github.com/k3s-io/klipper-helm.git
+    klipper_helm_build_dir: "{{ k3s_user_home }}/klipper-helm-src"
+    klipper_helm_image_ref: "localhost/klipper-helm:riscv64-local"
+    klipper_helm_registry_ref: "{{ registry_endpoint }}/klipper-helm:riscv64-local"
+
+  tasks:
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_architecture == "riscv64"
+        fail_msg: >-
+          This playbook builds a riscv64 klipper-helm image and will not
+          produce anything useful on {{ ansible_architecture }}. Target it
+          explicitly, e.g. --limit k8s-rv2-01.
+
+    - name: Check whether the klipper-helm image is already present in the registry
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/klipper-helm/tags/list"
+        status_code: [200, 404]
+      register: klipper_helm_registry_check
+
+    - name: Install buildah and its container-networking/OCI-runtime helpers
+      ansible.builtin.apt:
+        # buildah alone isn't enough:
+        # - netavark: the network namespace it sets up around each RUN
+        #   step (needed since the Dockerfile's RUN steps do git
+        #   clone/apk add/go mod download, all of which need network
+        #   access mid-build).
+        # - crun: buildah has no default OCI runtime bundled at all on
+        #   this image (`buildah info` reports an empty OCIRuntime, and
+        #   RUN steps fail with a low-level "exec: no command" error
+        #   without it) - neither crun nor runc is installed by default.
+        # - nftables: netavark shells out to the `nft` CLI to set up its
+        #   network namespace and fails ("unable to execute nft: No such
+        #   file or directory") without it.
+        # Checked directly against the actual buildah bud failures, not
+        # assumed.
+        name:
+          - buildah
+          - netavark
+          - crun
+          - nftables
+        state: present
+        update_cache: true
+      when: klipper_helm_registry_check.status == 404
+
+    - name: Clone klipper-helm at the tag matching k3s's referenced image
+      ansible.builtin.git:
+        repo: "{{ klipper_helm_repo_url }}"
+        dest: "{{ klipper_helm_build_dir }}"
+        version: "{{ klipper_helm_git_tag }}"
+        depth: 1
+        # force=true: re-runs reset to the pristine pinned tag rather than
+        # failing on local modifications - the modifications in question
+        # are just this same playbook's own Dockerfile patches (below),
+        # which reapply idempotently afterward either way.
+        force: true
+      become: false
+      when: klipper_helm_registry_check.status == 404
+
+    - name: Patch Dockerfile - add riscv64 to the GOARCH case statement
+      ansible.builtin.lineinfile:
+        path: "{{ klipper_helm_build_dir }}/Dockerfile"
+        insertafter: '^\s*amd64\)\s+export GOARCH="amd64" ;; \\$'
+        line: '        riscv64)    export GOARCH="riscv64" ;; \'
+      become: false
+      when: klipper_helm_registry_check.status == 404
+
+    - name: Patch Dockerfile - replace alpine/git (no riscv64 build) with alpine + apk git
+      ansible.builtin.lineinfile:
+        path: "{{ klipper_helm_build_dir }}/Dockerfile"
+        regexp: '^FROM alpine/git:[0-9.]+ AS helm-src$'
+        line: 'FROM alpine:3.23 AS helm-src'
+      become: false
+      when: klipper_helm_registry_check.status == 404
+
+    - name: Patch Dockerfile - install git before cloning helm source
+      ansible.builtin.lineinfile:
+        path: "{{ klipper_helm_build_dir }}/Dockerfile"
+        insertbefore: '^RUN git clone --branch'
+        line: 'RUN apk add --no-cache git'
+      become: false
+      when: klipper_helm_registry_check.status == 404
+
+    - name: Build the riscv64 klipper-helm image with buildah
+      ansible.builtin.command:
+        cmd: "buildah bud -t {{ klipper_helm_image_ref }} ."
+        chdir: "{{ klipper_helm_build_dir }}"
+      when: klipper_helm_registry_check.status == 404
+      changed_when: true
+
+    - name: Export the built image to an OCI archive
+      ansible.builtin.command:
+        cmd: >-
+          buildah push {{ klipper_helm_image_ref }}
+          oci-archive:{{ klipper_helm_build_dir }}/klipper-helm-riscv64.oci.tar:{{ klipper_helm_image_ref }}
+      when: klipper_helm_registry_check.status == 404
+      changed_when: true
+
+    - name: Import the image into k3s's containerd
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images import {{ klipper_helm_build_dir }}/klipper-helm-riscv64.oci.tar
+      when: klipper_helm_registry_check.status == 404
+      changed_when: true
+
+    - name: Tag the image for the local registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images tag {{ klipper_helm_image_ref }} {{ klipper_helm_registry_ref }}
+      when: klipper_helm_registry_check.status == 404
+      changed_when: true
+
+    - name: Push the image into the local registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images push --plain-http {{ klipper_helm_registry_ref }}
+      when: klipper_helm_registry_check.status == 404
+      changed_when: true
+
+    - name: Verify the registry serves back what was pushed
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/klipper-helm/tags/list"
+        return_content: true
+      register: klipper_helm_registry_verify
+
+    - name: Assert the pushed tag is visible in the registry catalog
+      ansible.builtin.assert:
+        that: "'riscv64-local' in klipper_helm_registry_verify.content"
+        fail_msg: "Registry does not report the pushed klipper-helm tag: {{ klipper_helm_registry_verify.content }}"
+
+    # --- Point k3s's helm-controller at the riscv64 image ---------------------
+    - name: Configure k3s to use the riscv64 pause + helm-job images
+      ansible.builtin.template:
+        src: ../templates/k3s-config.yaml.j2
+        dest: /etc/rancher/k3s/config.yaml
+        owner: root
+        group: root
+        mode: "0644"
+      vars:
+        k3s_pause_image: "localhost/pause:riscv64-local"
+        k3s_helm_job_image: "{{ klipper_helm_registry_ref }}"
+      notify: restart k3s
+
+    - name: Flush handlers so the config change takes effect before validation
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for node to report Ready after restart
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get node --no-headers
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: node_ready_check
+      until: "'Ready' in node_ready_check.stdout"
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    # --- Validation -------------------------------------------------------
+    - name: Wait for the traefik helm-install jobs to complete
+      ansible.builtin.command: >-
+        k3s kubectl -n kube-system get job helm-install-traefik helm-install-traefik-crd
+        -o jsonpath={.items[*].status.succeeded}
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: helm_install_check
+      until: "helm_install_check.stdout.split() == ['1', '1']"
+      retries: 24
+      delay: 10
+      changed_when: false
+
+    - name: Wait for traefik pods to be Running
+      ansible.builtin.command: >-
+        k3s kubectl -n kube-system get pods -l app.kubernetes.io/name=traefik
+        -o jsonpath={.items[*].status.phase}
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: traefik_pod_check
+      until: "'Running' in traefik_pod_check.stdout"
+      retries: 24
+      delay: 10
+      changed_when: false
+
+    - name: Report final traefik state for operator review
+      ansible.builtin.command: k3s kubectl -n kube-system get pods -l app.kubernetes.io/name=traefik -o wide
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: traefik_final_state
+      changed_when: false
+
+    - name: Show traefik pod state
+      ansible.builtin.debug:
+        msg: "{{ traefik_final_state.stdout_lines }}"
+
+  handlers:
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: restarted
