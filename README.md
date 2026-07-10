@@ -1,4 +1,4 @@
-# k8s-arm
+# k8s-risc-v
 
 Ansible-managed home Kubernetes lab spanning two architectures: an arm64
 board (Orange Pi 5 Plus, RK3588) and a riscv64 board (Orange Pi RV2), both
