@@ -56,6 +56,7 @@ playbooks/06_riscv64_registry.yml              - local OCI registry for riscv64 
 playbooks/07_riscv64_klipper_helm.yml          - rebuild rancher/klipper-helm for riscv64 (unblocks Traefik's helm-install jobs)
 playbooks/08_riscv64_klipper_lb.yml            - rebuild rancher/klipper-lb for riscv64 (unblocks svclb-* ServiceLB pods); also enables the docker.io mirror-with-fallback
 playbooks/09_riscv64_metrics_server.yml        - rebuild metrics-server for riscv64
+playbooks/10_riscv64_local_path_busybox.yml    - durable (mirror-based) fix for local-path-provisioner's busybox image, replacing the fragile live-patch approach
 templates/                                     - Jinja2 templates rendered by the playbooks above
 files/                                         - static assets (hand-built riscv64 pause image source, generalized single-binary OCI image builder)
 tools/                                         - hardware-recovery build scripts (RK3588 Maskrom recovery)

@@ -1,0 +1,195 @@
+---
+# playbooks/05_k3s_riscv64_build.yml already live-patches the
+# local-path-provisioner helper pod's busybox reference (via `kubectl
+# patch configmap local-path-config`), same as this playbook's approach -
+# but that patch is fragile: it doesn't survive k3s re-applying its
+# bundled local-path-storage addon manifest, which happens on at least
+# some k3s restarts (observed directly - the configmap silently reverted
+# to rancher/mirrored-library-busybox:1.37.0 at some point after several
+# k3s restarts from playbooks/07-09, breaking the *next* PVC any workload
+# tried to create, with no warning until something actually needed
+# storage).
+#
+# Fixed the same durable way as playbooks/08_riscv64_klipper_lb.yml and
+# playbooks/09_riscv64_metrics_server.yml: push the riscv64 platform of
+# the already-riscv64-capable Docker-official busybox:1.37.0 into the
+# local registry under the broken image's EXACT original repository
+# path/tag (rancher/mirrored-library-busybox:1.37.0), so the docker.io
+# mirror-with-fallback serves it automatically no matter how many more
+# times that configmap gets reset - no live patch to maintain, and no
+# dependency on the configmap staying in whatever state playbook 05 last
+# left it.
+#
+# Uses skopeo instead of buildah/k3s-ctr-tag-push here: busybox:1.37.0 is
+# cached locally as a full multi-platform index (all 9 platforms), and
+# `k3s ctr images push` tries to push the whole index tree - which fails
+# because only the riscv64 blobs were ever actually pulled. skopeo copy
+# --override-arch extracts just the one platform cleanly.
+- name: Push a riscv64 busybox build to fix local-path-provisioner durably
+  hosts: k8s_nodes
+  become: true
+  vars:
+    registry_node_port: 30500
+    registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
+    busybox_version: "1.37.0"
+    # Exact original path/tag k3s's local-path-provisioner helper pod
+    # references by default - required for the docker.io mirror to serve
+    # this in place of the missing upstream image.
+    busybox_registry_ref: "{{ registry_endpoint }}/rancher/mirrored-library-busybox:{{ busybox_version }}"
+
+  tasks:
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_architecture == "riscv64"
+        fail_msg: >-
+          This playbook pushes a riscv64 busybox build and will not
+          produce anything useful on {{ ansible_architecture }}. Target it
+          explicitly, e.g. --limit k8s-rv2-01.
+
+    - name: Check whether the busybox image is already present in the registry
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/rancher/mirrored-library-busybox/tags/list"
+        status_code: [200, 404]
+      register: busybox_registry_check
+
+    - name: Install skopeo
+      ansible.builtin.apt:
+        name: skopeo
+        state: present
+        update_cache: true
+      when: busybox_registry_check.status == 404
+
+    - name: Copy the riscv64 platform of busybox into the local registry
+      ansible.builtin.command: >-
+        skopeo copy --override-arch riscv64 --override-os linux --dest-tls-verify=false
+        docker://docker.io/library/busybox:{{ busybox_version }}
+        docker://{{ busybox_registry_ref }}
+      when: busybox_registry_check.status == 404
+      changed_when: true
+
+    - name: Verify the registry serves back what was pushed
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/rancher/mirrored-library-busybox/tags/list"
+        return_content: true
+      register: busybox_registry_verify
+
+    - name: Assert the pushed tag is visible in the registry catalog
+      ansible.builtin.assert:
+        that: "busybox_version in busybox_registry_verify.content"
+        fail_msg: "Registry does not report the pushed busybox tag: {{ busybox_registry_verify.content }}"
+
+    # --- Ensure the docker.io mirror-with-fallback is enabled -------------
+    # Idempotent no-op if playbooks/08_riscv64_klipper_lb.yml already ran;
+    # self-contained if this playbook is run standalone.
+    - name: Configure containerd with the docker.io mirror-with-fallback
+      ansible.builtin.template:
+        src: ../templates/k3s-registries.yaml.j2
+        dest: /etc/rancher/k3s/registries.yaml
+        owner: root
+        group: root
+        mode: "0644"
+      vars:
+        mirror_docker_io: true
+      notify: restart k3s
+
+    - name: Flush handlers so the mirror config takes effect before validation
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for node to report Ready after any restart
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get node --no-headers
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: node_ready_check
+      until: "'Ready' in node_ready_check.stdout"
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    # --- Validation: actually provision a throwaway PVC, not just check
+    #     the image is reachable -------------------------------------------
+    - name: Create a throwaway namespace for validation
+      ansible.builtin.command: >-
+        k3s kubectl create namespace local-path-busybox-check --dry-run=client -o yaml
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: validation_ns_manifest
+      changed_when: false
+
+    - name: Apply the throwaway namespace
+      ansible.builtin.shell: >-
+        echo '{{ validation_ns_manifest.stdout }}' | k3s kubectl apply -f -
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      changed_when: true
+
+    - name: Create a throwaway PVC to exercise the actual provisioning path
+      ansible.builtin.shell: |
+        k3s kubectl -n local-path-busybox-check apply -f - <<'EOF'
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: busybox-check
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: local-path
+          resources:
+            requests:
+              storage: 16Mi
+        EOF
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      changed_when: true
+
+    - name: Force provisioning by scheduling a pod that mounts the throwaway PVC
+      ansible.builtin.shell: |
+        k3s kubectl -n local-path-busybox-check apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: busybox-check
+        spec:
+          containers:
+            - name: check
+              image: busybox:1.37.0
+              command: ["sh", "-c", "sleep 3600"]
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: busybox-check
+        EOF
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      changed_when: true
+
+    - name: Wait for the throwaway PVC to bind
+      ansible.builtin.command: >-
+        k3s kubectl -n local-path-busybox-check get pvc busybox-check -o jsonpath={.status.phase}
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: validation_pvc_check
+      until: "validation_pvc_check.stdout == 'Bound'"
+      retries: 18
+      delay: 10
+      changed_when: false
+
+    - name: Clean up the throwaway namespace
+      ansible.builtin.command: >-
+        k3s kubectl delete namespace local-path-busybox-check --wait=false
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      changed_when: true
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg: "local-path-provisioner busybox fix verified - throwaway PVC bound successfully."
+
+  handlers:
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: restarted

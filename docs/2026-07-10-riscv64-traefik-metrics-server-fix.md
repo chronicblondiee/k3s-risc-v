@@ -173,6 +173,37 @@ riscv64-registry   riscv64-registry-...              1/1     Running
 against Traefik returns its actual default 404 response (confirming it's
 genuinely serving, not just `Running`).
 
+## Addendum: the busybox fix from `05` silently reverted
+
+While testing a throwaway workload (a `Deployment` + `PersistentVolumeClaim`
++ Traefik `Ingress`) to validate the fixes above end-to-end, the PVC got
+stuck `Pending` — the exact same `rancher/mirrored-library-busybox:1.37.0`
+`ImagePullBackOff` that `playbooks/05_k3s_riscv64_build.yml` was supposed
+to have already fixed via `kubectl patch configmap local-path-config`.
+Checking the configmap directly confirmed it had reverted to the broken
+default — most likely because k3s's deploy-controller re-applied its
+bundled `local-path-storage` addon manifest during one of the several k3s
+restarts triggered by `playbooks/07-09` earlier in this session. Live
+`kubectl patch` fixes to resources that a controller actively reconciles
+don't survive being reconciled again.
+
+Fixed the same durable way as `klipper-lb` and `metrics-server` above,
+in `playbooks/10_riscv64_local_path_busybox.yml`: push the
+Docker-official `busybox:1.37.0` (already riscv64-capable, that's *why*
+the original fix pointed at it) into the local registry under the
+broken image's exact original path (`rancher/mirrored-library-busybox:1.37.0`),
+so the `docker.io` mirror-with-fallback serves it regardless of how many
+more times that configmap gets reset. Used `skopeo copy --override-arch
+riscv64` rather than `k3s ctr images tag`/`push` here: the locally cached
+`busybox:1.37.0` is a full 9-platform manifest index, and `ctr images
+push` tries to push the whole index tree (fails, since only the riscv64
+blobs were ever actually pulled) - `skopeo copy --override-arch` extracts
+just the one platform cleanly.
+
+The playbook's own validation doesn't just check the image is reachable -
+it provisions and deletes a real throwaway PVC to prove the actual
+provisioning path works end-to-end.
+
 ## Published artifacts
 
 All riscv64 build outputs from this session (k3s binary + systemd unit,

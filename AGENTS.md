@@ -160,6 +160,16 @@ working state, kept for reference.
   `docs/2026-07-10-riscv64-traefik-metrics-server-fix.md`. Pre-built
   artifacts published at
   [releases/riscv64-v1.36.2-k3s1](https://github.com/chronicblondiee/k3s-risc-v/releases/tag/riscv64-v1.36.2-k3s1).
+- **`local-path-provisioner` busybox fix reverted itself:** the live
+  `kubectl patch configmap local-path-config` fix from
+  `playbooks/05_k3s_riscv64_build.yml` doesn't survive k3s re-applying
+  its bundled addon manifest, which happened during this session's k3s
+  restarts and silently broke the *next* PVC any workload tried to
+  create. Fixed durably (same mirror pattern as klipper-lb/metrics-server
+  above) in `playbooks/10_riscv64_local_path_busybox.yml` - if you see
+  `rancher/mirrored-library-busybox` `ImagePullBackOff` again despite
+  playbook 05 having run, this is why; re-run playbook 10, don't just
+  re-patch the configmap by hand.
 - **`kubectl` access:** works directly as the admin user, no sudo, from a normal
   interactive SSH login (`kubectl get nodes`, etc.) — `/usr/local/bin/kubectl`
   is a symlink to the multi-call `k3s` binary, and `~/.kube/config` is a
