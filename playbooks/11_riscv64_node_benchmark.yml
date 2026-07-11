@@ -507,6 +507,51 @@
             flat: true
           tags: [always]
 
+        # --- docs/benchmarks.md history row -----------------------------------
+        # Full runs only (every suite's register defined): tag-subset runs
+        # would produce rows that are mostly n/a and pollute the history.
+        # The extracted numbers are convenience excerpts; the linked report
+        # stays the artifact of record.
+        - name: Build the docs history row
+          ansible.builtin.set_fact:
+            bench_summary_row: >-
+              | {{ bench_timestamp }}
+              | {{ ctx_k3s.stdout | regex_search('k3s version (\S+)', '\1') | first | default('n/a') }}
+              | {{ ctx_kernel.stdout | regex_search('Linux (\S+)', '\1') | first | default('n/a') }}
+              | {{ sysbench_cpu_single.stdout | regex_search('events per second:\s+([0-9.]+)', '\1') | first }}
+              | {{ sysbench_cpu_multi.stdout | regex_search('events per second:\s+([0-9.]+)', '\1') | first }}
+              | {{ sysbench_mem_write.stdout | regex_search('\(([0-9.]+) MiB/sec\)', '\1') | first }}
+              / {{ sysbench_mem_read.stdout | regex_search('\(([0-9.]+) MiB/sec\)', '\1') | first }}
+              | {{ fio_seq_write.stdout | regex_search('bw=([0-9.]+[KMG]iB/s)', '\1') | first }}
+              / {{ fio_seq_read.stdout | regex_search('bw=([0-9.]+[KMG]iB/s)', '\1') | first }}
+              | {{ fio_rand_write.stdout | regex_search('bw=([0-9.]+[KMG]iB/s)', '\1') | first }}
+              / {{ fio_rand_read.stdout | regex_search('bw=([0-9.]+[KMG]iB/s)', '\1') | first }}
+              | {{ fio_pvc_seq_write.stdout | regex_search('bw=([0-9.]+[KMG]iB/s)', '\1') | first }}
+              / {{ fio_pvc_rand_read.stdout | regex_search('bw=([0-9.]+[KMG]iB/s)', '\1') | first }}
+              | [report](../benchmarks/results/{{ inventory_hostname }}-{{ bench_timestamp }}.md) |
+          when:
+            - sysbench_cpu_single.stdout is defined
+            - sysbench_cpu_multi.stdout is defined
+            - sysbench_mem_write.stdout is defined
+            - sysbench_mem_read.stdout is defined
+            - fio_seq_write.stdout is defined
+            - fio_seq_read.stdout is defined
+            - fio_rand_write.stdout is defined
+            - fio_rand_read.stdout is defined
+            - fio_pvc_seq_write.stdout is defined
+            - fio_pvc_rand_read.stdout is defined
+          tags: [always]
+
+        - name: Append the history row to docs/benchmarks.md (newest first)
+          ansible.builtin.lineinfile:
+            path: "{{ playbook_dir }}/../docs/benchmarks.md"
+            insertafter: '^<!-- newest-first: playbook 11 inserts summary rows below this line -->$'
+            line: "{{ bench_summary_row }}"
+          delegate_to: localhost
+          become: false
+          when: bench_summary_row is defined
+          tags: [always]
+
         - name: Show benchmark summary
           ansible.builtin.debug:
             msg: >-
