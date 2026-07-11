@@ -1,0 +1,85 @@
+{
+  "timestamp": "2026-07-11T12:41:35Z",
+  "kernel": "Linux 6.18.35-current-spacemit #3 SMP PREEMPT_DYNAMIC Tue Jun  9 13:38:30 UTC 2026 riscv64",
+  "go_version": "go1.26.2",
+  "goos": "linux",
+  "goarch": "riscv64",
+  "kernel_available": true,
+  "has_ime": true,
+  "cpuinfo_gate": "uarch: spacemit,x60, mvendorid: 0x710",
+  "iterations": 200000,
+  "results": [
+    {
+      "variant": "signed-signed",
+      "path": "pure-go",
+      "iterations": 200000,
+      "total_nanos": 350080886,
+      "nanos_per_tile": 1750.40443,
+      "tiles_per_second": 571296.5431651701,
+      "skipped": false
+    },
+    {
+      "variant": "signed-signed",
+      "path": "ime",
+      "iterations": 200000,
+      "total_nanos": 72249877,
+      "nanos_per_tile": 361.249385,
+      "tiles_per_second": 2768170.802560674,
+      "skipped": false
+    },
+    {
+      "variant": "unsigned-unsigned",
+      "path": "pure-go",
+      "iterations": 200000,
+      "total_nanos": 287932532,
+      "nanos_per_tile": 1439.66266,
+      "tiles_per_second": 694607.1658203596,
+      "skipped": false
+    },
+    {
+      "variant": "unsigned-unsigned",
+      "path": "ime",
+      "iterations": 200000,
+      "total_nanos": 71974300,
+      "nanos_per_tile": 359.8715,
+      "tiles_per_second": 2778769.644164653,
+      "skipped": false
+    },
+    {
+      "variant": "signed-unsigned",
+      "path": "pure-go",
+      "iterations": 200000,
+      "total_nanos": 333018144,
+      "nanos_per_tile": 1665.09072,
+      "tiles_per_second": 600567.8777670445,
+      "skipped": false
+    },
+    {
+      "variant": "signed-unsigned",
+      "path": "ime",
+      "iterations": 200000,
+      "total_nanos": 73243354,
+      "nanos_per_tile": 366.21677,
+      "tiles_per_second": 2730623.1770871663,
+      "skipped": false
+    },
+    {
+      "variant": "unsigned-signed",
+      "path": "pure-go",
+      "iterations": 200000,
+      "total_nanos": 321355739,
+      "nanos_per_tile": 1606.778695,
+      "tiles_per_second": 622363.2433712347,
+      "skipped": false
+    },
+    {
+      "variant": "unsigned-signed",
+      "path": "ime",
+      "iterations": 200000,
+      "total_nanos": 72460206,
+      "nanos_per_tile": 362.30103,
+      "tiles_per_second": 2760135.6805416755,
+      "skipped": false
+    }
+  ]
+}

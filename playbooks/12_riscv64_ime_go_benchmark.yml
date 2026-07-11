@@ -1,0 +1,160 @@
+---
+# Builds and runs the standalone SpacemiT X60 IME Go/cgo benchmark on the
+# riscv64 node. This is deliberately host-side only: it does not deploy a
+# Kubernetes workload, build an image, or push to the local registry.
+- name: Benchmark SpacemiT X60 IME from Go on the riscv64 node
+  hosts: k8s_nodes
+  become: false
+  vars:
+    ime_user: "{{ ansible_user }}"
+    ime_user_home: "/home/{{ ime_user }}"
+    ime_go_bin: "{{ ime_user_home }}/sdk/go/bin/go"
+    ime_scratch_dir: "{{ ime_user_home }}/x60-ime-go-benchmark"
+    ime_src_dir: "{{ ime_scratch_dir }}/src"
+    ime_bin: "{{ ime_scratch_dir }}/imebench"
+    ime_report_dir: "{{ ime_scratch_dir }}/reports"
+    ime_results_local_dir: "{{ playbook_dir }}/../benchmarks/results"
+    ime_iterations: 200000
+
+  tasks:
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_facts["architecture"] == "riscv64"
+        fail_msg: >-
+          This playbook benchmarks the SpacemiT X60 IME on the riscv64
+          node. Target it explicitly, e.g. --limit k8s-rv2-01.
+      tags: [always]
+
+    - name: Require the Go SDK installed by the k3s source-build playbook
+      ansible.builtin.stat:
+        path: "{{ ime_go_bin }}"
+      register: ime_go_stat
+      tags: [always]
+
+    - name: Abort if the Go SDK is missing
+      ansible.builtin.assert:
+        that:
+          - ime_go_stat.stat.exists
+          - ime_go_stat.stat.executable
+        fail_msg: >-
+          {{ ime_go_bin }} is missing or not executable. Run
+          playbooks/05_k3s_riscv64_build.yml first; this benchmark reuses
+          that on-board Go toolchain.
+      tags: [always]
+
+    - name: Require gcc for cgo and GNU assembler .insn support
+      ansible.builtin.command: gcc --version
+      register: ime_gcc_version
+      changed_when: false
+      failed_when: ime_gcc_version.rc != 0
+      tags: [always]
+
+    - name: Record the benchmark timestamp
+      ansible.builtin.set_fact:
+        ime_timestamp: "{{ ansible_facts['date_time']['iso8601_basic_short'] }}"
+      tags: [always]
+
+    - name: Create local results directory
+      ansible.builtin.file:
+        path: "{{ ime_results_local_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      tags: [always]
+
+    - name: Reset remote benchmark source directory
+      ansible.builtin.file:
+        path: "{{ ime_src_dir }}"
+        state: absent
+      tags: [always]
+
+    - name: Create remote benchmark directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ ime_src_dir }}"
+        - "{{ ime_report_dir }}"
+      tags: [always]
+
+    - name: Copy the Go IME benchmark source to the node
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../tools/x60-ime-go/"
+        dest: "{{ ime_src_dir }}/"
+        mode: preserve
+      tags: [always]
+
+    - name: Capture kernel version
+      ansible.builtin.command: uname -srvm
+      register: ime_kernel
+      changed_when: false
+      tags: [always]
+
+    - name: Capture Go version
+      ansible.builtin.command: "{{ ime_go_bin }} version"
+      register: ime_go_version
+      changed_when: false
+      tags: [always]
+
+    - name: Run Go tests with cgo enabled
+      ansible.builtin.command:
+        cmd: "{{ ime_go_bin }} test ./..."
+        chdir: "{{ ime_src_dir }}"
+      environment:
+        CGO_ENABLED: "1"
+      register: ime_go_test
+      changed_when: false
+      tags: [test]
+
+    - name: Build imebench
+      ansible.builtin.command:
+        cmd: "{{ ime_go_bin }} build -o {{ ime_bin }} ./cmd/imebench"
+        chdir: "{{ ime_src_dir }}"
+      environment:
+        CGO_ENABLED: "1"
+      changed_when: true
+      tags: [test, bench]
+
+    - name: Run IME detection
+      ansible.builtin.command: "{{ ime_bin }} detect"
+      register: ime_detect
+      changed_when: false
+      tags: [test, bench]
+
+    - name: Run IME selftest
+      ansible.builtin.command: "{{ ime_bin }} selftest"
+      register: ime_selftest
+      changed_when: false
+      tags: [test]
+
+    - name: Run IME benchmark
+      ansible.builtin.command: >-
+        {{ ime_bin }} bench
+        -iterations {{ ime_iterations }}
+        -markdown {{ ime_report_dir }}/k8s-rv2-01-ime-{{ ime_timestamp }}.md
+        -json {{ ime_report_dir }}/k8s-rv2-01-ime-{{ ime_timestamp }}.json
+      register: ime_bench
+      changed_when: false
+      tags: [bench]
+
+    - name: Fetch the Markdown benchmark report
+      ansible.builtin.fetch:
+        src: "{{ ime_report_dir }}/k8s-rv2-01-ime-{{ ime_timestamp }}.md"
+        dest: "{{ ime_results_local_dir }}/k8s-rv2-01-ime-{{ ime_timestamp }}.md"
+        flat: true
+      tags: [bench]
+
+    - name: Fetch the JSON benchmark report
+      ansible.builtin.fetch:
+        src: "{{ ime_report_dir }}/k8s-rv2-01-ime-{{ ime_timestamp }}.json"
+        dest: "{{ ime_results_local_dir }}/k8s-rv2-01-ime-{{ ime_timestamp }}.json"
+        flat: true
+      tags: [bench]
+
+    - name: Show benchmark report path
+      ansible.builtin.debug:
+        msg: >-
+          Fetched IME benchmark reports to
+          {{ ime_results_local_dir }}/k8s-rv2-01-ime-{{ ime_timestamp }}.{md,json}
+      tags: [bench]

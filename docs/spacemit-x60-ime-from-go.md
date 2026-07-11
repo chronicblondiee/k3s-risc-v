@@ -1,7 +1,9 @@
-# Using the X60's IME matrix instructions from Go (future work)
+# Using the X60's IME matrix instructions from Go
 
-**Status:** not implemented — this documents the viable approaches so we can
-revisit later. Companion to
+**Status:** prototype benchmark implemented in
+[`tools/x60-ime-go`](../tools/x60-ime-go). Latest fetched node result:
+[`benchmarks/results/k8s-rv2-01-ime-20260711T124020.md`](../benchmarks/results/k8s-rv2-01-ime-20260711T124020.md).
+Companion to
 [spacemit-x60-cpu-deep-dive.md](spacemit-x60-cpu-deep-dive.md), which covers
 what IME is in the context of the whole core.
 
@@ -85,6 +87,50 @@ vmadot + vse32) exposed as `int8_gemm_tile(...)`, called through cgo:
 This is the pragmatic middle: real assembler macros instead of hand-hexed
 `WORD`s, still no vendor toolchain.
 
+**Implemented prototype:** `tools/x60-ime-go` is a standalone Go module with
+an `ime` package and `cmd/imebench` CLI. It implements only the fixed X60
+VLEN=256 shape used for the first proof:
+
+- `A`: 4x8 INT8, row-major.
+- `B`: 4x8 INT8, row-major, consumed as transposed by `vmadot*`.
+- `dst`: 4x4 INT32 accumulator, row-major.
+- Operation: `dst += widen(A) * transpose(widen(B))`.
+
+The Linux/riscv64+cgo path uses RVV loads/stores plus Remlab's confirmed
+CUSTOM_1 encoding pattern:
+
+```asm
+.insn r CUSTOM_1, funct3, 0x71, x4, x1, x2
+```
+
+where `v4/v5` hold the even destination register group, `v1` is `A`, and
+`v2` is `B`. `funct3` is `3` for signed/signed, `0` for unsigned/unsigned,
+`2` for signed/unsigned, and `1` for unsigned/signed. The cgo file sets
+`-march=rv64gcv` explicitly because GCC's default target flags on this node
+do not enable RVV mnemonics for inline assembler.
+
+`imebench selftest` runs the actual IME instruction first in a child process,
+so a bad encoding fails as a controlled child `SIGILL` instead of killing the
+parent process. It then compares all four signedness variants against the
+pure-Go reference over deterministic edge cases and randomized inputs.
+
+`playbooks/12_riscv64_ime_go_benchmark.yml` copies the module to the node,
+requires the existing `~/sdk/go/bin/go` and `gcc` from the k3s source-build
+setup, runs `go test ./...`, `imebench selftest`, and `imebench bench`, then
+fetches Markdown and JSON reports to `benchmarks/results/`. Do not add these
+IME numbers to `docs/benchmarks.md`; keep them separate from the general node
+benchmark history.
+
+First successful run on 2026-07-11:
+
+- CPU gate: `uarch: spacemit,x60`, `mvendorid: 0x710`.
+- `go test ./...`: passed on-node with `CGO_ENABLED=1`.
+- SIGILL child probe and correctness selftest: passed.
+- Tiny per-tile benchmark, 200,000 iterations per variant: pure Go measured
+  about 1.4-1.75 us/tile; IME measured about 360-366 ns/tile. This is useful
+  proof of execution, not a tuned throughput number, because it still crosses
+  cgo once per tile.
+
 ## Approach C — cgo against SpacemiT's own kernels
 
 SpacemiT's Bianbu toolchain forks understand IME natively, and their
@@ -105,11 +151,10 @@ and the IME weirdness stays quarantined in one image.
 
 ## Recommendation and revisit triggers
 
-Default plan when we pick this up: **Approach B first** (cheapest path to a
-working `vmadot`), benchmarked against a plain-RVV and a pure-Go INT8 GEMM
-of the same shape; promote to Approach A only if cgo ergonomics annoy, or to
-C/D only if a real inference workload lands on the node. Worth revisiting
-if any of these change:
+Default path is now **Approach B** via `tools/x60-ime-go`: keep it as a
+benchmark/proof tool unless a real inference workload needs more. Promote to
+Approach A only if cgo ergonomics annoy, or to C/D only if a real inference
+workload lands on the node. Worth revisiting if any of these change:
 
 - Go gains vendor-extension or intrinsics support (unlikely; watch
   [golang/go#61476](https://github.com/golang/go/issues/61476) descendants).
@@ -119,15 +164,17 @@ if any of these change:
 - Mainline GCC/LLVM grow XSTIME support (would upgrade Approach B to plain
   intrinsics).
 
-## Verification plan (when implemented)
+## Verification plan
 
-1. SIGILL smoke test: run the kernel under the `/proc/cpuinfo` gate on the
-   node; confirm a clean fallback path off-node (CI runners are not X60s).
-2. Correctness: compare `vmadot` GEMM output against a pure-Go int32
-   reference for random int8 matrices, including the signedness variants.
-3. Performance: microbenchmark scalar vs RVV vs IME INT8 GEMM at a few sizes;
-   record results in [benchmarks.md](benchmarks.md) style — the interesting
-   number is how close we get to the claimed ~2 TOPS.
+1. Local/off-node: `go test ./...` in `tools/x60-ime-go`; `imebench detect`
+   should report no IME without crashing.
+2. On `k8s-rv2-01`: run
+   `ansible-playbook playbooks/12_riscv64_ime_go_benchmark.yml --limit k8s-rv2-01`.
+3. Confirm the fetched Markdown and JSON report exist under
+   `benchmarks/results/`.
+4. Treat the current cgo-per-tile benchmark as proof of instruction execution
+   and correctness only. A real throughput study should move larger matrix
+   loops across the cgo boundary and add a plain-RVV comparison.
 
 ## Sources
 
