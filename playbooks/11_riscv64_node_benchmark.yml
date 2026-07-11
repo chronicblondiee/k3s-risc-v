@@ -3,9 +3,10 @@
 # timestamped markdown report back to benchmarks/results/ so runs can be
 # compared across k3s builds / kernel updates.
 #
-# Tooling: sysbench (cpu, memory) + fio (disk). stress-ng was considered
-# and skipped deliberately - it's a load generator / stressor, not a
-# benchmark, and produces no comparable scalar results.
+# Tooling: sysbench (cpu, memory) + fio (disk) + iperf3 (network).
+# stress-ng was considered and skipped deliberately - it's a load
+# generator / stressor, not a benchmark, and produces no comparable
+# scalar results.
 #
 # Storage is measured twice:
 #   - host-level: fio with direct I/O against a scratch file on the NVMe
@@ -14,9 +15,15 @@
 #     is a hostPath bind onto the same NVMe, so this measures the
 #     end-to-end k8s volume path rather than a different disk. No
 #     upstream fio image publishes riscv64 (same gap as playbooks/07-10),
-#     so a tiny alpine+fio image is built on-device with buildah and
-#     pushed to the local registry, one-time, guarded by the same
+#     so a tiny alpine+fio+iperf3 image is built on-device with buildah
+#     and pushed to the local registry, one-time, guarded by the same
 #     registry-tags check as playbooks/07/10.
+#
+# Network is measured three ways: node loopback (TCP-stack baseline),
+# control machine <-> node over the LAN (the real NIC - skipped with a
+# warning if iperf3 isn't installed on the control machine), and
+# host -> pod IP through the CNI (k8s network-path overhead, comparable
+# against the loopback baseline since both stay on-box).
 #
 # WARNING: this runs on the live k3s node. k3s/etcd background CPU and
 # I/O both perturb the results and are perturbed by the benchmark - don't
@@ -24,7 +31,8 @@
 # as "node as operated", not as bare-silicon figures. The report records
 # the running pod count for exactly that reason.
 #
-# Subsets: --tags cpu / memory / storage / k8s-storage. Preflight,
+# Subsets: --tags cpu / memory / network / storage / k8s-storage /
+# k8s-network. Preflight,
 # report+fetch, and cleanup are tagged `always`, so any subset still
 # produces a (partial) report and cleans up after itself.
 #
@@ -47,13 +55,17 @@
     bench_results_local_dir: "{{ playbook_dir }}/../benchmarks/results"
     registry_node_port: 30500
     registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
-    fio_image_ref: "{{ registry_endpoint }}/benchmark-fio:riscv64-local"
-    fio_build_dir: "{{ bench_user_home }}/benchmark-fio-image"
+    # benchmark-tools supersedes the fio-only benchmark-fio image (which
+    # can be left in the registry harmlessly) - same alpine base plus
+    # iperf3 for the CNI network test.
+    tools_image_ref: "{{ registry_endpoint }}/benchmark-tools:riscv64-local"
+    tools_build_dir: "{{ bench_user_home }}/benchmark-tools-image"
     bench_namespace: node-benchmark
     # 1G with --direct=1 is honest on an 8GB-RAM board: direct I/O
     # bypasses the page cache, so the file doesn't need to exceed RAM.
     fio_file_size: 1G
     fio_runtime_secs: 30
+    iperf_time_secs: 10
     pvc_size: 4Gi
     # 1G host fio file + up to 1G in the PVC + headroom for the one-time
     # image build.
@@ -92,6 +104,7 @@
         name:
           - fio
           - sysbench
+          - iperf3
         state: present
         update_cache: true
       tags: [always]
@@ -164,6 +177,12 @@
       changed_when: false
       tags: [always]
 
+    - name: Capture iperf3 version
+      ansible.builtin.command: iperf3 --version
+      register: ctx_iperf_ver
+      changed_when: false
+      tags: [always]
+
     - name: Count pods running during the benchmark (background load)
       ansible.builtin.shell: k3s kubectl get pods -A --no-headers | wc -l
       environment:
@@ -222,6 +241,63 @@
           changed_when: false
           tags: [memory]
 
+        # --- Network: host-level iperf3 ---------------------------------------
+        # Loopback isolates the TCP stack (CPU-bound on this SoC); the LAN
+        # pair measures the actual NIC in both directions, driven from the
+        # control machine so traffic really crosses the wire. The server
+        # is started fresh (killing any leftover from an aborted run) and
+        # stopped again in the always: cleanup.
+        - name: Check for iperf3 on the control machine
+          ansible.builtin.command: which iperf3
+          delegate_to: localhost
+          become: false
+          register: iperf3_local_check
+          changed_when: false
+          failed_when: false
+          tags: [network]
+
+        - name: Warn if the LAN throughput test has to be skipped
+          ansible.builtin.debug:
+            msg: >-
+              iperf3 not found on the control machine - skipping the LAN
+              tests (install it locally, e.g. brew install iperf3, to
+              enable them). Loopback and pod tests still run.
+          when: iperf3_local_check.rc != 0
+          tags: [network]
+
+        - name: Start an iperf3 server on the node
+          ansible.builtin.shell: pkill -x iperf3 || true; iperf3 -s -D
+          become: false
+          changed_when: true
+          tags: [network]
+
+        - name: Benchmark network - node loopback (TCP-stack baseline)
+          ansible.builtin.command: iperf3 -c 127.0.0.1 -t {{ iperf_time_secs }}
+          become: false
+          register: iperf_loopback
+          changed_when: false
+          tags: [network]
+
+        - name: Benchmark network - LAN receive (control machine -> node)
+          ansible.builtin.command: >-
+            iperf3 -c {{ ansible_default_ipv4.address }} -t {{ iperf_time_secs }}
+          delegate_to: localhost
+          become: false
+          register: iperf_lan_rx
+          changed_when: false
+          when: iperf3_local_check.rc == 0
+          tags: [network]
+
+        - name: Benchmark network - LAN transmit (node -> control machine, -R)
+          ansible.builtin.command: >-
+            iperf3 -c {{ ansible_default_ipv4.address }} -R -t {{ iperf_time_secs }}
+          delegate_to: localhost
+          become: false
+          register: iperf_lan_tx
+          changed_when: false
+          when: iperf3_local_check.rc == 0
+          tags: [network]
+
         # --- Storage: host-level fio ----------------------------------------
         # direct=1 bypasses the page cache (see fio_file_size comment in
         # vars). 1M/iodepth-8 measures sequential bandwidth, 4k/iodepth-32
@@ -271,18 +347,20 @@
           changed_when: false
           tags: [storage]
 
-        # --- Storage: in-cluster fio through a local-path PVC ----------------
-        # Deliberately does NOT template registries.yaml or restart k3s (a
-        # benchmark playbook shouldn't bounce the thing it measures) -
-        # instead it requires the mirror config playbooks 06/08/10 already
-        # deploy. The pod pulls {{ registry_endpoint }}/benchmark-fio
-        # directly; the registry's own mirrors: entry in registries.yaml
-        # is what makes that plain-HTTP pull work.
+        # --- In-cluster legs: shared namespace/PVC/pod infrastructure --------
+        # Used by both the k8s-storage and k8s-network suites (the pod
+        # carries fio AND iperf3). Deliberately does NOT template
+        # registries.yaml or restart k3s (a benchmark playbook shouldn't
+        # bounce the thing it measures) - instead it requires the mirror
+        # config playbooks 06/08/10 already deploy. The pod pulls
+        # {{ registry_endpoint }}/benchmark-tools directly; the registry's
+        # own mirrors: entry in registries.yaml is what makes that
+        # plain-HTTP pull work.
         - name: Require the registry mirror config from playbooks 06/08/10
           ansible.builtin.stat:
             path: /etc/rancher/k3s/registries.yaml
           register: registries_yaml
-          tags: [k8s-storage]
+          tags: [k8s-storage, k8s-network]
 
         - name: Abort if the registry mirror config is missing
           ansible.builtin.assert:
@@ -291,14 +369,14 @@
               /etc/rancher/k3s/registries.yaml is missing - the benchmark
               pod can't pull from the plain-HTTP local registry without
               it. Run playbooks 06/08/10 first.
-          tags: [k8s-storage]
+          tags: [k8s-storage, k8s-network]
 
-        - name: Check whether the fio image is already present in the registry
+        - name: Check whether the tools image is already present in the registry
           ansible.builtin.uri:
-            url: "http://{{ registry_endpoint }}/v2/benchmark-fio/tags/list"
+            url: "http://{{ registry_endpoint }}/v2/benchmark-tools/tags/list"
             status_code: [200, 404]
-          register: fio_registry_check
-          tags: [k8s-storage]
+          register: tools_registry_check
+          tags: [k8s-storage, k8s-network]
 
         - name: Install buildah and its container-networking/OCI-runtime helpers
           ansible.builtin.apt:
@@ -316,63 +394,63 @@
               - nftables
             state: present
             update_cache: true
-          when: fio_registry_check.status == 404
-          tags: [k8s-storage]
+          when: tools_registry_check.status == 404
+          tags: [k8s-storage, k8s-network]
 
-        - name: Create the fio image build directory
+        - name: Create the tools image build directory
           ansible.builtin.file:
-            path: "{{ fio_build_dir }}"
+            path: "{{ tools_build_dir }}"
             state: directory
             mode: "0755"
-          when: fio_registry_check.status == 404
-          tags: [k8s-storage]
+          when: tools_registry_check.status == 404
+          tags: [k8s-storage, k8s-network]
 
-        - name: Write the fio image Containerfile
+        - name: Write the tools image Containerfile
           ansible.builtin.copy:
             # alpine:3.23 publishes riscv64 (playbooks/07 already relies on
-            # exactly this base); no upstream fio image does. Building
-            # on-device keeps every later benchmark run hermetic - no
-            # apk-add-at-pod-start dependency on Alpine's CDN.
+            # exactly this base); no upstream fio or iperf3 image does.
+            # Building on-device keeps every later benchmark run hermetic -
+            # no apk-add-at-pod-start dependency on Alpine's CDN.
             content: |
               FROM docker.io/library/alpine:3.23
-              RUN apk add --no-cache fio
-            dest: "{{ fio_build_dir }}/Containerfile"
+              RUN apk add --no-cache fio iperf3
+            dest: "{{ tools_build_dir }}/Containerfile"
             mode: "0644"
-          when: fio_registry_check.status == 404
-          tags: [k8s-storage]
+          when: tools_registry_check.status == 404
+          tags: [k8s-storage, k8s-network]
 
-        - name: Build the riscv64 fio image with buildah
+        - name: Build the riscv64 tools image with buildah
           ansible.builtin.command:
-            cmd: "buildah bud -t localhost/benchmark-fio:riscv64-local ."
-            chdir: "{{ fio_build_dir }}"
-          when: fio_registry_check.status == 404
+            cmd: "buildah bud -t localhost/benchmark-tools:riscv64-local ."
+            chdir: "{{ tools_build_dir }}"
+          when: tools_registry_check.status == 404
           changed_when: true
-          tags: [k8s-storage]
+          tags: [k8s-storage, k8s-network]
 
-        - name: Push the fio image into the local registry
+        - name: Push the tools image into the local registry
           # buildah push straight to the registry - playbooks/07's
           # ctr-import/tag/push chain was only needed because k3s itself
           # consumed that image from containerd; nothing here does.
           ansible.builtin.command: >-
             buildah push --tls-verify=false
-            localhost/benchmark-fio:riscv64-local
-            docker://{{ fio_image_ref }}
-          when: fio_registry_check.status == 404
+            localhost/benchmark-tools:riscv64-local
+            docker://{{ tools_image_ref }}
+          when: tools_registry_check.status == 404
           changed_when: true
-          tags: [k8s-storage]
+          tags: [k8s-storage, k8s-network]
 
-        - name: Verify the registry serves back the fio image
+        - name: Verify the registry serves back the tools image
           ansible.builtin.uri:
-            url: "http://{{ registry_endpoint }}/v2/benchmark-fio/tags/list"
+            url: "http://{{ registry_endpoint }}/v2/benchmark-tools/tags/list"
             return_content: true
-          register: fio_registry_verify
-          tags: [k8s-storage]
+          register: tools_registry_verify
+          tags: [k8s-storage, k8s-network]
 
-        - name: Assert the fio tag is visible in the registry catalog
+        - name: Assert the tools tag is visible in the registry catalog
           ansible.builtin.assert:
-            that: "'riscv64-local' in fio_registry_verify.content"
-            fail_msg: "Registry does not report the pushed fio tag: {{ fio_registry_verify.content }}"
-          tags: [k8s-storage]
+            that: "'riscv64-local' in tools_registry_verify.content"
+            fail_msg: "Registry does not report the pushed tools tag: {{ tools_registry_verify.content }}"
+          tags: [k8s-storage, k8s-network]
 
         - name: Create the benchmark namespace manifest
           ansible.builtin.command: >-
@@ -381,7 +459,7 @@
             KUBECONFIG: /etc/rancher/k3s/k3s.yaml
           register: bench_ns_manifest
           changed_when: false
-          tags: [k8s-storage]
+          tags: [k8s-storage, k8s-network]
 
         - name: Apply the benchmark namespace
           ansible.builtin.shell: >-
@@ -389,7 +467,7 @@
           environment:
             KUBECONFIG: /etc/rancher/k3s/k3s.yaml
           changed_when: true
-          tags: [k8s-storage]
+          tags: [k8s-storage, k8s-network]
 
         - name: Create a PVC on the local-path storage class
           ansible.builtin.shell: |
@@ -408,19 +486,19 @@
           environment:
             KUBECONFIG: /etc/rancher/k3s/k3s.yaml
           changed_when: true
-          tags: [k8s-storage]
+          tags: [k8s-storage, k8s-network]
 
-        - name: Schedule the fio pod mounting the PVC
+        - name: Schedule the tools pod mounting the PVC
           ansible.builtin.shell: |
             k3s kubectl -n {{ bench_namespace }} apply -f - <<EOF
             apiVersion: v1
             kind: Pod
             metadata:
-              name: benchmark-fio
+              name: benchmark-tools
             spec:
               containers:
-                - name: fio
-                  image: {{ fio_image_ref }}
+                - name: tools
+                  image: {{ tools_image_ref }}
                   command: ["sleep", "infinity"]
                   volumeMounts:
                     - name: data
@@ -433,7 +511,7 @@
           environment:
             KUBECONFIG: /etc/rancher/k3s/k3s.yaml
           changed_when: true
-          tags: [k8s-storage]
+          tags: [k8s-storage, k8s-network]
 
         - name: Wait for the benchmark PVC to bind
           ansible.builtin.command: >-
@@ -445,11 +523,11 @@
           retries: 18
           delay: 10
           changed_when: false
-          tags: [k8s-storage]
+          tags: [k8s-storage, k8s-network]
 
-        - name: Wait for the fio pod to be Running
+        - name: Wait for the tools pod to be Running
           ansible.builtin.command: >-
-            k3s kubectl -n {{ bench_namespace }} get pod benchmark-fio -o jsonpath={.status.phase}
+            k3s kubectl -n {{ bench_namespace }} get pod benchmark-tools -o jsonpath={.status.phase}
           environment:
             KUBECONFIG: /etc/rancher/k3s/k3s.yaml
           register: bench_pod_check
@@ -457,14 +535,14 @@
           retries: 24
           delay: 5
           changed_when: false
-          tags: [k8s-storage]
+          tags: [k8s-storage, k8s-network]
 
         # Two tests (not four): local-path is a hostPath bind onto the same
         # NVMe, so the point is the k8s-volume-path overhead vs the host
         # numbers, and one bandwidth + one IOPS test shows that.
         - name: Benchmark PVC storage - sequential write
           ansible.builtin.command: >-
-            k3s kubectl -n {{ bench_namespace }} exec benchmark-fio -- fio
+            k3s kubectl -n {{ bench_namespace }} exec benchmark-tools -- fio
             --name=pvc-seq-write --filename=/data/fio-test.dat
             --size={{ fio_file_size }} --direct=1 --ioengine=libaio
             --time_based --runtime={{ fio_runtime_secs }} --group_reporting
@@ -477,7 +555,7 @@
 
         - name: Benchmark PVC storage - random read IOPS
           ansible.builtin.command: >-
-            k3s kubectl -n {{ bench_namespace }} exec benchmark-fio -- fio
+            k3s kubectl -n {{ bench_namespace }} exec benchmark-tools -- fio
             --name=pvc-rand-read --filename=/data/fio-test.dat
             --size={{ fio_file_size }} --direct=1 --ioengine=libaio
             --time_based --runtime={{ fio_runtime_secs }} --group_reporting
@@ -487,6 +565,34 @@
           register: fio_pvc_rand_read
           changed_when: false
           tags: [k8s-storage]
+
+        # --- Network: host -> pod through the CNI -----------------------------
+        # Same-box like the loopback test, so the delta vs loopback is the
+        # CNI/veth path cost, not the NIC.
+        - name: Start an iperf3 server inside the tools pod
+          ansible.builtin.command: >-
+            k3s kubectl -n {{ bench_namespace }} exec benchmark-tools -- iperf3 -s -D
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          changed_when: true
+          tags: [k8s-network]
+
+        - name: Look up the tools pod IP
+          ansible.builtin.command: >-
+            k3s kubectl -n {{ bench_namespace }} get pod benchmark-tools -o jsonpath={.status.podIP}
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          register: bench_pod_ip
+          changed_when: false
+          tags: [k8s-network]
+
+        - name: Benchmark network - host -> pod IP through the CNI
+          ansible.builtin.command: >-
+            iperf3 -c {{ bench_pod_ip.stdout }} -t {{ iperf_time_secs }}
+          become: false
+          register: iperf_pod
+          changed_when: false
+          tags: [k8s-network]
 
         # --- Report + fetch ---------------------------------------------------
         # Last in the block: a report is only assembled for runs that got
@@ -528,6 +634,10 @@
               / {{ fio_rand_read.stdout | regex_search('bw=([0-9.]+[KMG]iB/s)', '\1') | first }}
               | {{ fio_pvc_seq_write.stdout | regex_search('bw=([0-9.]+[KMG]iB/s)', '\1') | first }}
               / {{ fio_pvc_rand_read.stdout | regex_search('bw=([0-9.]+[KMG]iB/s)', '\1') | first }}
+              | {{ iperf_loopback.stdout | regex_search('([0-9.]+ [KMG]?bits/sec)\s+receiver', '\1') | first }}
+              / {{ (iperf_lan_rx.stdout | regex_search('([0-9.]+ [KMG]?bits/sec)\s+receiver', '\1') | first) if iperf_lan_rx.stdout is defined else 'n/a' }}
+              / {{ (iperf_lan_tx.stdout | regex_search('([0-9.]+ [KMG]?bits/sec)\s+receiver', '\1') | first) if iperf_lan_tx.stdout is defined else 'n/a' }}
+              / {{ iperf_pod.stdout | regex_search('([0-9.]+ [KMG]?bits/sec)\s+receiver', '\1') | first }}
               | [report](../benchmarks/results/{{ inventory_hostname }}-{{ bench_timestamp }}.md) |
           when:
             - sysbench_cpu_single.stdout is defined
@@ -540,6 +650,10 @@
             - fio_rand_read.stdout is defined
             - fio_pvc_seq_write.stdout is defined
             - fio_pvc_rand_read.stdout is defined
+            # LAN cells are optional (control machine may lack iperf3);
+            # the on-node network tests are required for a full-run row.
+            - iperf_loopback.stdout is defined
+            - iperf_pod.stdout is defined
           tags: [always]
 
         - name: Append the history row to docs/benchmarks.md (newest first)
@@ -565,7 +679,11 @@
               + (fio_rand_write.stdout_lines | default([]) | select('search', 'WRITE:') | map('regex_replace', '^\s*', 'host rand ') | list)
               + (fio_rand_read.stdout_lines | default([]) | select('search', 'READ:') | map('regex_replace', '^\s*', 'host rand ') | list)
               + (fio_pvc_seq_write.stdout_lines | default([]) | select('search', 'WRITE:') | map('regex_replace', '^\s*', 'pvc seq ') | list)
-              + (fio_pvc_rand_read.stdout_lines | default([]) | select('search', 'READ:') | map('regex_replace', '^\s*', 'pvc rand ') | list) }}
+              + (fio_pvc_rand_read.stdout_lines | default([]) | select('search', 'READ:') | map('regex_replace', '^\s*', 'pvc rand ') | list)
+              + (iperf_loopback.stdout_lines | default([]) | select('search', 'receiver') | map('regex_replace', '^\s*', 'net loopback ') | list)
+              + (iperf_lan_rx.stdout_lines | default([]) | select('search', 'receiver') | map('regex_replace', '^\s*', 'net lan rx ') | list)
+              + (iperf_lan_tx.stdout_lines | default([]) | select('search', 'receiver') | map('regex_replace', '^\s*', 'net lan tx ') | list)
+              + (iperf_pod.stdout_lines | default([]) | select('search', 'receiver') | map('regex_replace', '^\s*', 'net pod ') | list) }}
           tags: [always]
 
       # --- Cleanup: runs even when a benchmark task fails -------------------
@@ -588,4 +706,11 @@
           ansible.builtin.file:
             path: "{{ bench_tmp_dir }}"
             state: absent
+          tags: [always]
+
+        - name: Stop any leftover iperf3 server on the node
+          ansible.builtin.command: pkill -x iperf3
+          become: false
+          changed_when: true
+          failed_when: false
           tags: [always]

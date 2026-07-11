@@ -14,6 +14,7 @@ benchmark was skipped (e.g. a `--tags cpu` run).
 - k3s: `{{ ctx_k3s.stdout | default('n/a (k3s not responding)') }}`
 - fio: `{{ ctx_fio_ver.stdout | default('n/a') }}`
 - sysbench: `{{ ctx_sysbench_ver.stdout | default('n/a') }}`
+- iperf3: `{{ ctx_iperf_ver.stdout | default('n/a') }}`
 - Pods running during benchmark (background load): {{ ctx_pod_count.stdout | default('n/a') }}
 
 ### lscpu
@@ -89,6 +90,34 @@ benchmark was skipped (e.g. a `--tags cpu` run).
 {{ fio_rand_read.stdout | default('n/a') }}
 ```
 {% endif %}
+{% if iperf_loopback.stdout is defined or iperf_lan_rx.stdout is defined %}
+
+## Network (iperf3)
+{% if iperf_loopback.stdout is defined %}
+
+### Node loopback (TCP-stack baseline, stays on-box)
+
+```
+{{ iperf_loopback.stdout }}
+```
+{% endif %}
+{% if iperf_lan_rx.stdout is defined %}
+
+### LAN receive (control machine -> node)
+
+```
+{{ iperf_lan_rx.stdout }}
+```
+{% endif %}
+{% if iperf_lan_tx.stdout is defined %}
+
+### LAN transmit (node -> control machine, iperf3 -R)
+
+```
+{{ iperf_lan_tx.stdout }}
+```
+{% endif %}
+{% endif %}
 {% if fio_pvc_seq_write.stdout is defined %}
 
 ## Storage - in-cluster fio (local-path PVC, same NVMe via hostPath bind mount)
@@ -103,5 +132,16 @@ benchmark was skipped (e.g. a `--tags cpu` run).
 
 ```
 {{ fio_pvc_rand_read.stdout | default('n/a') }}
+```
+{% endif %}
+{% if iperf_pod.stdout is defined %}
+
+## Network - in-cluster iperf3 (host -> pod IP through the CNI)
+
+Same-box like the loopback test above, so the delta vs loopback is the
+CNI/veth path cost, not the NIC.
+
+```
+{{ iperf_pod.stdout }}
 ```
 {% endif %}
