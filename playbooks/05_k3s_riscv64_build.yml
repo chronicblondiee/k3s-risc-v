@@ -29,6 +29,11 @@
     k3s_build_env:
       ARCH: riscv64
       GOARCH: riscv64
+      # The X60 implements the RVA22 profile (docs/spacemit-x60-cpu-deep-dive.md).
+      # Without this Go targets the rva20u64 baseline and never emits the
+      # Zba/Zbb instructions this core has. Do NOT bump to rva23u64: the X60
+      # lacks Zfa/Zawrs/Zimop and an RVA23 binary can hit illegal instructions.
+      GORISCV64: rva22u64
       GIT_TAG: "{{ k3s_git_tag }}"
       PATH: "{{ k3s_user_home }}/bin:{{ go_sdk_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       # /tmp on this board's default Armbian image is tmpfs (RAM-backed,
