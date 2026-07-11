@@ -196,6 +196,8 @@ host_vars/<hostname>.yml.example               - copy to <hostname>.yml (gitigno
 playbooks/00-04_*.yml                          - see plan doc below for the intended sequence
 playbooks/05_k3s_riscv64_build.yml             - build+install k3s from source on k8s-rv2-01, riscv64-only
 playbooks/06_riscv64_registry.yml              - local OCI registry on k8s-rv2-01 for riscv64 image distribution
+playbooks/11_riscv64_node_benchmark.yml        - CPU/memory/storage benchmark (host fio+sysbench + local-path PVC fio), riscv64-only
+benchmarks/results/                            - timestamped benchmark reports fetched back by playbook 11
 templates/static-ip.yaml.j2                    - netplan template for 02_base_config.yml
 templates/k3s-config.yaml.j2, k3s-registries.yaml.j2, riscv64-registry.yaml.j2
                                                 - k3s/registry config for 05/06 (see those playbooks + docs/)

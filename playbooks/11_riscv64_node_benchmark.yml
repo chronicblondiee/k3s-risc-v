@@ -1,0 +1,546 @@
+---
+# Benchmarks the riscv64 node's CPU, memory, and storage, and fetches a
+# timestamped markdown report back to benchmarks/results/ so runs can be
+# compared across k3s builds / kernel updates.
+#
+# Tooling: sysbench (cpu, memory) + fio (disk). stress-ng was considered
+# and skipped deliberately - it's a load generator / stressor, not a
+# benchmark, and produces no comparable scalar results.
+#
+# Storage is measured twice:
+#   - host-level: fio with direct I/O against a scratch file on the NVMe
+#     root fs (the only disk in the box),
+#   - in-cluster: fio inside a pod against a local-path PVC - local-path
+#     is a hostPath bind onto the same NVMe, so this measures the
+#     end-to-end k8s volume path rather than a different disk. No
+#     upstream fio image publishes riscv64 (same gap as playbooks/07-10),
+#     so a tiny alpine+fio image is built on-device with buildah and
+#     pushed to the local registry, one-time, guarded by the same
+#     registry-tags check as playbooks/07/10.
+#
+# WARNING: this runs on the live k3s node. k3s/etcd background CPU and
+# I/O both perturb the results and are perturbed by the benchmark - don't
+# run it while anything latency-sensitive is deployed, and read numbers
+# as "node as operated", not as bare-silicon figures. The report records
+# the running pod count for exactly that reason.
+#
+# Subsets: --tags cpu / memory / storage / k8s-storage. Preflight,
+# report+fetch, and cleanup are tagged `always`, so any subset still
+# produces a (partial) report and cleans up after itself.
+#
+# Prerequisites at runtime: playbooks/05 (k3s), 06 (local registry), and
+# 10 (busybox fix - without it the local-path helper pod can't start and
+# the benchmark PVC never binds). Only needed for the k8s-storage leg;
+# host-level tags work on a bare node.
+- name: Benchmark CPU, memory, and storage on the riscv64 node
+  hosts: k8s_nodes
+  become: true
+  vars:
+    bench_user: "{{ ansible_user }}"
+    bench_user_home: "/home/{{ bench_user }}"
+    # Scratch space lives in the homedir, NOT /tmp - /tmp is tmpfs on
+    # this Armbian image (same rationale as go_build_tmp_dir in
+    # playbooks/05_k3s_riscv64_build.yml), and a RAM-backed fio file
+    # would benchmark memory, not the NVMe. A tmpfs guard below enforces
+    # this rather than just assuming.
+    bench_tmp_dir: "{{ bench_user_home }}/benchmark-tmp"
+    bench_results_local_dir: "{{ playbook_dir }}/../benchmarks/results"
+    registry_node_port: 30500
+    registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
+    fio_image_ref: "{{ registry_endpoint }}/benchmark-fio:riscv64-local"
+    fio_build_dir: "{{ bench_user_home }}/benchmark-fio-image"
+    bench_namespace: node-benchmark
+    # 1G with --direct=1 is honest on an 8GB-RAM board: direct I/O
+    # bypasses the page cache, so the file doesn't need to exceed RAM.
+    fio_file_size: 1G
+    fio_runtime_secs: 30
+    pvc_size: 4Gi
+    # 1G host fio file + up to 1G in the PVC + headroom for the one-time
+    # image build.
+    min_free_disk_gb: 8
+    # ansible_processor_nproc, not ansible_processor_vcpus: the SpacemiT
+    # X60's cpuinfo confuses Ansible's topology facts (vcpus reports 16 on
+    # an 8-core no-SMT part); nproc comes from the scheduler and is right.
+    sysbench_threads: "{{ ansible_processor_nproc }}"
+
+  tasks:
+    # --- Preflight --------------------------------------------------------
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_architecture == "riscv64"
+        fail_msg: >-
+          This playbook benchmarks the riscv64 node and its riscv64-only
+          registry/image workarounds. Target it explicitly, e.g.
+          --limit k8s-rv2-01.
+      tags: [always]
+
+    - name: Abort unless there is enough free disk for the benchmark files
+      ansible.builtin.assert:
+        that: >-
+          (ansible_mounts | selectattr('mount', 'equalto', '/') | first).size_available
+          > min_free_disk_gb | int * 1024 * 1024 * 1024
+        fail_msg: >-
+          Less than {{ min_free_disk_gb }} GB free on / -
+          {{ ((ansible_mounts | selectattr('mount', 'equalto', '/') | first).size_available
+          / 1024 / 1024 / 1024) | round(1) }} GB available. The benchmark
+          writes a {{ fio_file_size }} scratch file plus up to
+          {{ fio_file_size }} in the PVC.
+      tags: [always]
+
+    - name: Install benchmark tools
+      ansible.builtin.apt:
+        name:
+          - fio
+          - sysbench
+        state: present
+        update_cache: true
+      tags: [always]
+
+    - name: Create the benchmark scratch directory
+      ansible.builtin.file:
+        path: "{{ bench_tmp_dir }}"
+        state: directory
+        mode: "0755"
+      become: false
+      tags: [always]
+
+    - name: Check which filesystem backs the scratch directory
+      ansible.builtin.command: df --output=fstype {{ bench_tmp_dir }}
+      register: bench_fstype
+      changed_when: false
+      tags: [always]
+
+    - name: Abort if the scratch directory landed on tmpfs
+      ansible.builtin.assert:
+        that: "'tmpfs' not in bench_fstype.stdout"
+        fail_msg: >-
+          {{ bench_tmp_dir }} is on tmpfs - fio would benchmark RAM, not
+          the NVMe. Point bench_tmp_dir at a disk-backed path.
+      tags: [always]
+
+    - name: Record the benchmark timestamp
+      ansible.builtin.set_fact:
+        bench_timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+      tags: [always]
+
+    # --- Context for the report (so runs are comparable) -------------------
+    # k3s/pod-count checks use failed_when: false so host-only runs
+    # (--tags cpu on a node with k3s stopped) still work.
+    - name: Capture kernel version
+      ansible.builtin.command: uname -srvm
+      register: ctx_kernel
+      changed_when: false
+      tags: [always]
+
+    - name: Capture CPU details
+      ansible.builtin.command: lscpu
+      register: ctx_lscpu
+      changed_when: false
+      tags: [always]
+
+    - name: Capture NVMe model
+      ansible.builtin.command: lsblk -d -o NAME,MODEL,SIZE /dev/nvme0n1
+      register: ctx_disk
+      changed_when: false
+      failed_when: false
+      tags: [always]
+
+    - name: Capture k3s version
+      ansible.builtin.command: /usr/local/bin/k3s --version
+      register: ctx_k3s
+      changed_when: false
+      failed_when: false
+      tags: [always]
+
+    - name: Capture fio version
+      ansible.builtin.command: fio --version
+      register: ctx_fio_ver
+      changed_when: false
+      tags: [always]
+
+    - name: Capture sysbench version
+      ansible.builtin.command: sysbench --version
+      register: ctx_sysbench_ver
+      changed_when: false
+      tags: [always]
+
+    - name: Count pods running during the benchmark (background load)
+      ansible.builtin.shell: k3s kubectl get pods -A --no-headers | wc -l
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: ctx_pod_count
+      changed_when: false
+      failed_when: false
+      tags: [always]
+
+    - name: Warn that results include live-node background load
+      ansible.builtin.debug:
+        msg: >-
+          Benchmarking a live k3s node with
+          {{ ctx_pod_count.stdout | default('?') }} pods running - k3s
+          background CPU/I-O is part of these numbers.
+      tags: [always]
+
+    - name: Run benchmarks, then always report and clean up
+      block:
+        # --- CPU ----------------------------------------------------------
+        # Single-thread first: the per-core number is what's comparable
+        # across boards; the all-core run shows scaling on this SoC.
+        - name: Benchmark CPU - single thread
+          ansible.builtin.command: sysbench cpu --threads=1 --time=15 run
+          register: sysbench_cpu_single
+          become: false
+          changed_when: false
+          tags: [cpu]
+
+        - name: Benchmark CPU - all cores
+          ansible.builtin.command: >-
+            sysbench cpu --threads={{ sysbench_threads }} --time=30 run
+          register: sysbench_cpu_multi
+          become: false
+          changed_when: false
+          tags: [cpu]
+
+        # --- Memory ---------------------------------------------------------
+        # --time caps the run even if the 8G total doesn't complete, so
+        # total runtime stays bounded on slow silicon.
+        - name: Benchmark memory - write bandwidth
+          ansible.builtin.command: >-
+            sysbench memory --memory-block-size=1M --memory-total-size=8G
+            --memory-oper=write --threads={{ sysbench_threads }} --time=20 run
+          register: sysbench_mem_write
+          become: false
+          changed_when: false
+          tags: [memory]
+
+        - name: Benchmark memory - read bandwidth
+          ansible.builtin.command: >-
+            sysbench memory --memory-block-size=1M --memory-total-size=8G
+            --memory-oper=read --threads={{ sysbench_threads }} --time=20 run
+          register: sysbench_mem_read
+          become: false
+          changed_when: false
+          tags: [memory]
+
+        # --- Storage: host-level fio ----------------------------------------
+        # direct=1 bypasses the page cache (see fio_file_size comment in
+        # vars). 1M/iodepth-8 measures sequential bandwidth, 4k/iodepth-32
+        # measures IOPS + completion latency. Sequential write runs first
+        # so it lays out the scratch file for the other three tests.
+        - name: Benchmark storage - sequential write
+          ansible.builtin.command: >-
+            fio --name=seq-write --filename={{ bench_tmp_dir }}/fio-test.dat
+            --size={{ fio_file_size }} --direct=1 --ioengine=libaio
+            --time_based --runtime={{ fio_runtime_secs }} --group_reporting
+            --rw=write --bs=1M --iodepth=8
+          register: fio_seq_write
+          become: false
+          changed_when: false
+          tags: [storage]
+
+        - name: Benchmark storage - sequential read
+          ansible.builtin.command: >-
+            fio --name=seq-read --filename={{ bench_tmp_dir }}/fio-test.dat
+            --size={{ fio_file_size }} --direct=1 --ioengine=libaio
+            --time_based --runtime={{ fio_runtime_secs }} --group_reporting
+            --rw=read --bs=1M --iodepth=8
+          register: fio_seq_read
+          become: false
+          changed_when: false
+          tags: [storage]
+
+        - name: Benchmark storage - random write IOPS
+          ansible.builtin.command: >-
+            fio --name=rand-write --filename={{ bench_tmp_dir }}/fio-test.dat
+            --size={{ fio_file_size }} --direct=1 --ioengine=libaio
+            --time_based --runtime={{ fio_runtime_secs }} --group_reporting
+            --rw=randwrite --bs=4k --iodepth=32
+          register: fio_rand_write
+          become: false
+          changed_when: false
+          tags: [storage]
+
+        - name: Benchmark storage - random read IOPS
+          ansible.builtin.command: >-
+            fio --name=rand-read --filename={{ bench_tmp_dir }}/fio-test.dat
+            --size={{ fio_file_size }} --direct=1 --ioengine=libaio
+            --time_based --runtime={{ fio_runtime_secs }} --group_reporting
+            --rw=randread --bs=4k --iodepth=32
+          register: fio_rand_read
+          become: false
+          changed_when: false
+          tags: [storage]
+
+        # --- Storage: in-cluster fio through a local-path PVC ----------------
+        # Deliberately does NOT template registries.yaml or restart k3s (a
+        # benchmark playbook shouldn't bounce the thing it measures) -
+        # instead it requires the mirror config playbooks 06/08/10 already
+        # deploy. The pod pulls {{ registry_endpoint }}/benchmark-fio
+        # directly; the registry's own mirrors: entry in registries.yaml
+        # is what makes that plain-HTTP pull work.
+        - name: Require the registry mirror config from playbooks 06/08/10
+          ansible.builtin.stat:
+            path: /etc/rancher/k3s/registries.yaml
+          register: registries_yaml
+          tags: [k8s-storage]
+
+        - name: Abort if the registry mirror config is missing
+          ansible.builtin.assert:
+            that: registries_yaml.stat.exists
+            fail_msg: >-
+              /etc/rancher/k3s/registries.yaml is missing - the benchmark
+              pod can't pull from the plain-HTTP local registry without
+              it. Run playbooks 06/08/10 first.
+          tags: [k8s-storage]
+
+        - name: Check whether the fio image is already present in the registry
+          ansible.builtin.uri:
+            url: "http://{{ registry_endpoint }}/v2/benchmark-fio/tags/list"
+            status_code: [200, 404]
+          register: fio_registry_check
+          tags: [k8s-storage]
+
+        - name: Install buildah and its container-networking/OCI-runtime helpers
+          ansible.builtin.apt:
+            # buildah alone isn't enough (checked directly against actual
+            # buildah bud failures in playbooks/07_riscv64_klipper_helm.yml,
+            # not assumed):
+            # - netavark: network namespace around each RUN step (the apk
+            #   add here needs network mid-build).
+            # - crun: buildah ships no default OCI runtime on this image.
+            # - nftables: netavark shells out to the `nft` CLI.
+            name:
+              - buildah
+              - netavark
+              - crun
+              - nftables
+            state: present
+            update_cache: true
+          when: fio_registry_check.status == 404
+          tags: [k8s-storage]
+
+        - name: Create the fio image build directory
+          ansible.builtin.file:
+            path: "{{ fio_build_dir }}"
+            state: directory
+            mode: "0755"
+          when: fio_registry_check.status == 404
+          tags: [k8s-storage]
+
+        - name: Write the fio image Containerfile
+          ansible.builtin.copy:
+            # alpine:3.23 publishes riscv64 (playbooks/07 already relies on
+            # exactly this base); no upstream fio image does. Building
+            # on-device keeps every later benchmark run hermetic - no
+            # apk-add-at-pod-start dependency on Alpine's CDN.
+            content: |
+              FROM docker.io/library/alpine:3.23
+              RUN apk add --no-cache fio
+            dest: "{{ fio_build_dir }}/Containerfile"
+            mode: "0644"
+          when: fio_registry_check.status == 404
+          tags: [k8s-storage]
+
+        - name: Build the riscv64 fio image with buildah
+          ansible.builtin.command:
+            cmd: "buildah bud -t localhost/benchmark-fio:riscv64-local ."
+            chdir: "{{ fio_build_dir }}"
+          when: fio_registry_check.status == 404
+          changed_when: true
+          tags: [k8s-storage]
+
+        - name: Push the fio image into the local registry
+          # buildah push straight to the registry - playbooks/07's
+          # ctr-import/tag/push chain was only needed because k3s itself
+          # consumed that image from containerd; nothing here does.
+          ansible.builtin.command: >-
+            buildah push --tls-verify=false
+            localhost/benchmark-fio:riscv64-local
+            docker://{{ fio_image_ref }}
+          when: fio_registry_check.status == 404
+          changed_when: true
+          tags: [k8s-storage]
+
+        - name: Verify the registry serves back the fio image
+          ansible.builtin.uri:
+            url: "http://{{ registry_endpoint }}/v2/benchmark-fio/tags/list"
+            return_content: true
+          register: fio_registry_verify
+          tags: [k8s-storage]
+
+        - name: Assert the fio tag is visible in the registry catalog
+          ansible.builtin.assert:
+            that: "'riscv64-local' in fio_registry_verify.content"
+            fail_msg: "Registry does not report the pushed fio tag: {{ fio_registry_verify.content }}"
+          tags: [k8s-storage]
+
+        - name: Create the benchmark namespace manifest
+          ansible.builtin.command: >-
+            k3s kubectl create namespace {{ bench_namespace }} --dry-run=client -o yaml
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          register: bench_ns_manifest
+          changed_when: false
+          tags: [k8s-storage]
+
+        - name: Apply the benchmark namespace
+          ansible.builtin.shell: >-
+            echo '{{ bench_ns_manifest.stdout }}' | k3s kubectl apply -f -
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          changed_when: true
+          tags: [k8s-storage]
+
+        - name: Create a PVC on the local-path storage class
+          ansible.builtin.shell: |
+            k3s kubectl -n {{ bench_namespace }} apply -f - <<EOF
+            apiVersion: v1
+            kind: PersistentVolumeClaim
+            metadata:
+              name: benchmark-data
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              storageClassName: local-path
+              resources:
+                requests:
+                  storage: {{ pvc_size }}
+            EOF
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          changed_when: true
+          tags: [k8s-storage]
+
+        - name: Schedule the fio pod mounting the PVC
+          ansible.builtin.shell: |
+            k3s kubectl -n {{ bench_namespace }} apply -f - <<EOF
+            apiVersion: v1
+            kind: Pod
+            metadata:
+              name: benchmark-fio
+            spec:
+              containers:
+                - name: fio
+                  image: {{ fio_image_ref }}
+                  command: ["sleep", "infinity"]
+                  volumeMounts:
+                    - name: data
+                      mountPath: /data
+              volumes:
+                - name: data
+                  persistentVolumeClaim:
+                    claimName: benchmark-data
+            EOF
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          changed_when: true
+          tags: [k8s-storage]
+
+        - name: Wait for the benchmark PVC to bind
+          ansible.builtin.command: >-
+            k3s kubectl -n {{ bench_namespace }} get pvc benchmark-data -o jsonpath={.status.phase}
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          register: bench_pvc_check
+          until: "bench_pvc_check.stdout == 'Bound'"
+          retries: 18
+          delay: 10
+          changed_when: false
+          tags: [k8s-storage]
+
+        - name: Wait for the fio pod to be Running
+          ansible.builtin.command: >-
+            k3s kubectl -n {{ bench_namespace }} get pod benchmark-fio -o jsonpath={.status.phase}
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          register: bench_pod_check
+          until: "bench_pod_check.stdout == 'Running'"
+          retries: 24
+          delay: 5
+          changed_when: false
+          tags: [k8s-storage]
+
+        # Two tests (not four): local-path is a hostPath bind onto the same
+        # NVMe, so the point is the k8s-volume-path overhead vs the host
+        # numbers, and one bandwidth + one IOPS test shows that.
+        - name: Benchmark PVC storage - sequential write
+          ansible.builtin.command: >-
+            k3s kubectl -n {{ bench_namespace }} exec benchmark-fio -- fio
+            --name=pvc-seq-write --filename=/data/fio-test.dat
+            --size={{ fio_file_size }} --direct=1 --ioengine=libaio
+            --time_based --runtime={{ fio_runtime_secs }} --group_reporting
+            --rw=write --bs=1M --iodepth=8
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          register: fio_pvc_seq_write
+          changed_when: false
+          tags: [k8s-storage]
+
+        - name: Benchmark PVC storage - random read IOPS
+          ansible.builtin.command: >-
+            k3s kubectl -n {{ bench_namespace }} exec benchmark-fio -- fio
+            --name=pvc-rand-read --filename=/data/fio-test.dat
+            --size={{ fio_file_size }} --direct=1 --ioengine=libaio
+            --time_based --runtime={{ fio_runtime_secs }} --group_reporting
+            --rw=randread --bs=4k --iodepth=32
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          register: fio_pvc_rand_read
+          changed_when: false
+          tags: [k8s-storage]
+
+        # --- Report + fetch ---------------------------------------------------
+        # Last in the block: a report is only assembled for runs that got
+        # here; partial-failure debugging comes from normal Ansible output.
+        # The template guards every section with `is defined`, so tag
+        # subsets produce a report with just their sections.
+        - name: Assemble the benchmark report
+          ansible.builtin.template:
+            src: ../templates/benchmark-report.md.j2
+            dest: "{{ bench_tmp_dir }}/{{ inventory_hostname }}-{{ bench_timestamp }}.md"
+            mode: "0644"
+          tags: [always]
+
+        - name: Fetch the report into benchmarks/results/
+          ansible.builtin.fetch:
+            src: "{{ bench_tmp_dir }}/{{ inventory_hostname }}-{{ bench_timestamp }}.md"
+            dest: "{{ bench_results_local_dir }}/{{ inventory_hostname }}-{{ bench_timestamp }}.md"
+            flat: true
+          tags: [always]
+
+        - name: Show benchmark summary
+          ansible.builtin.debug:
+            msg: >-
+              {{ ['Report: benchmarks/results/' ~ inventory_hostname ~ '-' ~ bench_timestamp ~ '.md']
+              + (sysbench_cpu_single.stdout_lines | default([]) | select('search', 'events per second') | map('regex_replace', '^\s*', 'cpu single-thread ') | list)
+              + (sysbench_cpu_multi.stdout_lines | default([]) | select('search', 'events per second') | map('regex_replace', '^\s*', 'cpu all-cores ') | list)
+              + (sysbench_mem_write.stdout_lines | default([]) | select('search', 'MiB/sec') | map('regex_replace', '^\s*', 'mem write ') | list)
+              + (sysbench_mem_read.stdout_lines | default([]) | select('search', 'MiB/sec') | map('regex_replace', '^\s*', 'mem read ') | list)
+              + (fio_seq_write.stdout_lines | default([]) | select('search', 'WRITE:') | map('regex_replace', '^\s*', 'host seq ') | list)
+              + (fio_seq_read.stdout_lines | default([]) | select('search', 'READ:') | map('regex_replace', '^\s*', 'host seq ') | list)
+              + (fio_rand_write.stdout_lines | default([]) | select('search', 'WRITE:') | map('regex_replace', '^\s*', 'host rand ') | list)
+              + (fio_rand_read.stdout_lines | default([]) | select('search', 'READ:') | map('regex_replace', '^\s*', 'host rand ') | list)
+              + (fio_pvc_seq_write.stdout_lines | default([]) | select('search', 'WRITE:') | map('regex_replace', '^\s*', 'pvc seq ') | list)
+              + (fio_pvc_rand_read.stdout_lines | default([]) | select('search', 'READ:') | map('regex_replace', '^\s*', 'pvc rand ') | list) }}
+          tags: [always]
+
+      # --- Cleanup: runs even when a benchmark task fails -------------------
+      # failed_when: false on the namespace delete so it neither masks the
+      # original error nor fails runs where the k8s leg never happened.
+      # Deliberately NOT removed: the fio image in the registry (reusable
+      # across runs, same idempotence contract as playbooks/07-10) and the
+      # apt packages.
+      always:
+        - name: Clean up the benchmark namespace
+          ansible.builtin.command: >-
+            k3s kubectl delete namespace {{ bench_namespace }} --ignore-not-found --wait=false
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          changed_when: true
+          failed_when: false
+          tags: [always]
+
+        - name: Remove the benchmark scratch directory
+          ansible.builtin.file:
+            path: "{{ bench_tmp_dir }}"
+            state: absent
+          tags: [always]
