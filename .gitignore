@@ -7,6 +7,7 @@ tools/rkbin/
 inventory.ini
 host_vars/*.yml
 .claude/
+.serena/
 id_rsa*
 id_ed25519*
 *.pem
