@@ -204,7 +204,7 @@ templates/k3s-config.yaml.j2, k3s-registries.yaml.j2, riscv64-registry.yaml.j2
 files/pause.c, files/build_pause_image.py      - hand-built riscv64 pause image assets for 05 (see docs/)
 tools/                                         - build scripts for hardware-recovery tooling (see below)
 docs/                                          - incident logs / troubleshooting runbooks, plus topical references
-                                                 (benchmarks.md history, spacemit-x60-cpu-deep-dive.md CPU feature guide)
+                                                 (benchmarks.md history, spacemit-x60-*.md CPU feature/IME guides)
 ```
 
 `inventory.ini`, `host_vars/*.yml`, `group_vars/all/vault.yml`, `.vault_pass`,

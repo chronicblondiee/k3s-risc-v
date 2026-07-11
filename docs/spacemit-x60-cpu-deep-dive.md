@@ -152,7 +152,9 @@ carry over well.
   [llama.cpp/Ollama fork demonstrates ~2 TOPS-class speedups](https://www.bit-brick.com/2024/12/04/k1-ai-cpu-deployment-of-large-models-based-on-llama-cpp-and-ollama/)
   on the K1. Mainline toolchains don't emit these — using them means
   SpacemiT's Bianbu forks or hand-rolled `.insn` encodings. Interesting
-  weekend experiment, not infrastructure.
+  weekend experiment, not infrastructure. Concrete implementation options
+  (including from Go) are written up in
+  [spacemit-x60-ime-from-go.md](spacemit-x60-ime-from-go.md).
 
 ### 5. Profiling actually works
 
