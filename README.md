@@ -169,6 +169,10 @@ including which operations are treated as destructive/hard-to-reverse
 - `playbooks/14_k3s_riscv64_ha_servers.yml` is the current onboarding path for
   the two additional riscv64 servers. It requires a real `k3s_api_endpoint`
   DNS/VIP and refuses to place embedded etcd on SD/MMC-rooted boards.
+  `k8s-rv2-02` and `k8s-rv2-03` are physically online, bootstrapped, and
+  NVMe-migrated as of 2026-07-12 (see
+  `docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md`); `03`/`04`/`06`/`10`
+  and the actual HA join are still pending.
 - `playbooks/06_riscv64_registry.yml` now separates the single registry host
   from registry consumers, pins the registry pod to the host node, and writes
   the same mirror-with-fallback config on all riscv64 nodes.

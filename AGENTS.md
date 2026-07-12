@@ -12,6 +12,15 @@ cluster goal is now three riscv64 k3s server nodes (`k8s-rv2-01`,
 the arm64 node and add a new x86 node, resuming the mixed-architecture goal.
 Until then, no mixed-arch work is in scope.
 
+**Status as of 2026-07-12:** `k8s-rv2-02` and `k8s-rv2-03` are physically
+online, bootstrapped (`00`), base-configured (`02`), and migrated to NVMe
+boot — see `docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md` for the
+full process and a board-identity gotcha worth reading before touching
+these nodes again (verify by NIC MAC against the router's DHCP
+reservations, not by whatever IP a board currently answers on). Still
+pending: `03`/`04`/`06`/`10` on both new boards, then the actual HA join
+via `playbooks/14_k3s_riscv64_ha_servers.yml`.
+
 ## Target k8s distribution: k3s (cluster-wide decision)
 
 Chosen over microk8s specifically because of the RISC-V node: microk8s is
