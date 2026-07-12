@@ -84,9 +84,36 @@ Restarted `keepalived` on `k8s-rv2-01` afterward; it preempted the VIP
 back (higher base priority), confirmed exactly one node held it
 afterward and the cluster stayed healthy the whole time.
 
+## VRRP virtual MAC, for the router's DHCP reservation
+
+A floating VIP doesn't have one fixed MAC by default: keepalived just adds
+it as a secondary address on the real interface, so ARP replies for it come
+from whichever physical board currently holds it — the MAC changes across
+failovers. That breaks a router DHCP reservation, which binds one IP to one
+MAC permanently.
+
+Fixed by enabling keepalived's VRRP virtual-MAC mode (`use_vmac` +
+`vmac_xmit_base` in `templates/keepalived.conf.j2`): the VIP now lives on a
+dedicated `vrrp.51@eth1` pseudo-interface with a constant MAC derived from
+`virtual_router_id` (`00:00:5e:00:01:33` for id `51`, per the VRRP spec),
+present identically on all three nodes regardless of which one currently
+holds the VIP. `vmac_xmit_base` keeps the actual VRRP protocol
+advertisements going out on the real interface (`eth1`) for reliability;
+only ARP/gratuitous-ARP for the VIP address itself uses the virtual MAC.
+
+Router-side reservation to add: **`192.168.1.83` → `00:00:5e:00:01:33`**.
+
+One gotcha this introduced: the playbook's "which node holds the VIP" check
+originally looked at `ip -o -4 addr show eth1` — after `use_vmac`, the VIP
+moved to the new `vrrp.51` interface, so that check silently reported "no
+one holds it" on every node even though the VIP was working correctly
+(confirmed via the readyz check, which doesn't care which interface it's
+on). Fixed by checking all interfaces (`ip -o -4 addr show`, no interface
+filter) instead of assuming which one.
+
 ## Still outstanding
 
-`192.168.1.83` needs a DHCP pool exclusion/reservation at the router, same
-as the still-open item for `.80`–`.82` from the onboarding doc — not
-something this repo can do; flagged for the user to confirm at the router
-admin UI.
+Router-side: add the reservation above, and exclude/reserve `.80`–`.82`
+too if not already applied — same still-open item flagged in the
+onboarding doc. Not something this repo can do; for the user to confirm at
+the router admin UI.

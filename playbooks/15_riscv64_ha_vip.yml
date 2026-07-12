@@ -88,7 +88,10 @@
       run_once: true
 
     - name: Check whether this node currently holds the VIP
-      ansible.builtin.command: "ip -o -4 addr show {{ k3s_vip_interface }}"
+      # use_vmac puts the VIP on a dedicated vrrp<id>@{{ k3s_vip_interface }}
+      # pseudo-interface, not on k3s_vip_interface itself - check all
+      # interfaces rather than assuming which one.
+      ansible.builtin.command: "ip -o -4 addr show"
       register: k3s_vip_holder_check
       changed_when: false
 
