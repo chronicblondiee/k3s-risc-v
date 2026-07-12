@@ -26,11 +26,11 @@
 # because only the riscv64 blobs were ever actually pulled. skopeo copy
 # --override-arch extracts just the one platform cleanly.
 - name: Push a riscv64 busybox build to fix local-path-provisioner durably
-  hosts: k8s_nodes
+  hosts: riscv64_registry_host
   become: true
   vars:
-    registry_node_port: 30500
-    registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
+    registry_host_name: "{{ groups[registry_host_group | default('riscv64_registry_host')][0] }}"
+    registry_endpoint: "{{ hostvars[registry_host_name].ansible_default_ipv4.address }}:{{ registry_node_port | default(30500) }}"
     busybox_version: "1.37.0"
     # Exact original path/tag k3s's local-path-provisioner helper pod
     # references by default - required for the docker.io mirror to serve

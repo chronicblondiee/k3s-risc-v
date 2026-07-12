@@ -1,0 +1,21 @@
+---
+# Copy to group_vars/all/cluster.yml (gitignored) and fill in the real
+# DNS/VIP name before running the HA server playbook.
+k3s_api_endpoint: k3s.example.lan
+k3s_api_port: 6443
+k3s_api_tls_sans:
+  - k3s.example.lan
+  - 192.168.1.102
+  - 192.168.1.103
+  - 192.168.1.104
+
+k3s_git_tag: v1.36.2+k3s1
+k3s_riscv64_release_repo: chronicblondiee/k3s-risc-v
+k3s_riscv64_release_tag: riscv64-v1.36.2-k3s1
+k3s_riscv64_binary_asset: k3s-riscv64
+
+registry_namespace: riscv64-registry
+registry_image: registry:3.0.0
+registry_storage_size: 4Gi
+registry_node_port: 30500
+registry_host_group: riscv64_registry_host

@@ -19,13 +19,13 @@
 #      riscv64 build (checked the same way) - swapped for plain alpine +
 #      `apk add git`, since that stage only needs `git clone`.
 - name: Build a riscv64 klipper-helm image and unblock Traefik's helm-install jobs
-  hosts: k8s_nodes
+  hosts: riscv64_registry_host
   become: true
   vars:
     k3s_user: "{{ ansible_user }}"
     k3s_user_home: "/home/{{ k3s_user }}"
-    registry_node_port: 30500
-    registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
+    registry_host_name: "{{ groups[registry_host_group | default('riscv64_registry_host')][0] }}"
+    registry_endpoint: "{{ hostvars[registry_host_name].ansible_default_ipv4.address }}:{{ registry_node_port | default(30500) }}"
     # Must match the klipper-helm image tag k3s's helm-controller actually
     # references (check: kubectl -n kube-system get pod -l job-name=helm-install-traefik
     # -o jsonpath='{.items[0].spec.containers[0].image}') - it's pinned to
@@ -170,7 +170,7 @@
         group: root
         mode: "0644"
       vars:
-        k3s_pause_image: "localhost/pause:riscv64-local"
+        k3s_pause_image: "{{ registry_endpoint }}/pause:riscv64-local"
         k3s_helm_job_image: "{{ klipper_helm_registry_ref }}"
       notify: restart k3s
 

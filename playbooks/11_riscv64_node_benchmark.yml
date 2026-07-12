@@ -53,8 +53,8 @@
     # this rather than just assuming.
     bench_tmp_dir: "{{ bench_user_home }}/benchmark-tmp"
     bench_results_local_dir: "{{ playbook_dir }}/../benchmarks/results"
-    registry_node_port: 30500
-    registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
+    registry_host_name: "{{ groups[registry_host_group | default('riscv64_registry_host')][0] }}"
+    registry_endpoint: "{{ hostvars[registry_host_name].ansible_default_ipv4.address }}:{{ registry_node_port | default(30500) }}"
     # benchmark-tools supersedes the fio-only benchmark-fio image (which
     # can be left in the registry harmlessly) - same alpine base plus
     # iperf3 for the CNI network test.

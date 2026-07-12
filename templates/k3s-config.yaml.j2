@@ -1,4 +1,22 @@
+{% if k3s_node_name is defined %}
+node-name: {{ k3s_node_name }}
+{% endif %}
 pause-image: {{ k3s_pause_image }}
-{% if k3s_helm_job_image is defined %}
+{% if k3s_helm_job_image is defined and k3s_helm_job_image %}
 helm-job-image: {{ k3s_helm_job_image }}
+{% endif %}
+{% if k3s_cluster_init | default(false) %}
+cluster-init: true
+{% endif %}
+{% if k3s_server_url is defined and k3s_server_url %}
+server: {{ k3s_server_url }}
+{% endif %}
+{% if k3s_token is defined and k3s_token %}
+token: {{ k3s_token }}
+{% endif %}
+{% if k3s_api_tls_sans is defined %}
+tls-san:
+{% for san in k3s_api_tls_sans %}
+  - {{ san }}
+{% endfor %}
 {% endif %}

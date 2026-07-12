@@ -5,11 +5,12 @@ began pivoting to a **mixed-architecture** cluster by adding a RISC-V node
 alongside it. Formerly named `k8s-arm`; renamed to reflect the current k3s
 and RISC-V focus.
 
-**Current focus: riscv64-only (`k8s-rv2-01`).** The original arm64 node
-(`k8s-node-01`) is offline due to a hardware failure — see its section
-below. Future work: repair/replace it and add a new x86 node, resuming the
-mixed-architecture goal. Until then, no multi-node/mixed-arch work is in
-scope.
+**Current focus: riscv64-only HA.** The original arm64 node (`k8s-node-01`)
+is offline due to a hardware failure — see its section below. The immediate
+cluster goal is now three riscv64 k3s server nodes (`k8s-rv2-01`,
+`k8s-rv2-02`, `k8s-rv2-03`) with embedded etcd. Future work: repair/replace
+the arm64 node and add a new x86 node, resuming the mixed-architecture goal.
+Until then, no mixed-arch work is in scope.
 
 ## Target k8s distribution: k3s (cluster-wide decision)
 
@@ -21,9 +22,10 @@ single static binary; there's no *official* riscv64 release either, but
 unlike microk8s there's a real path to one — see the k8s-rv2-01 section
 below for the from-source build being done for that node. This distro
 choice applies cluster-wide, not just to the RV2 node.
-`playbooks/04_k8s_node_prep.yml` (containerd/kubeadm-style prep) is closer
-to what k3s needs than to microk8s, but still needs review before use (see
-existing note below).
+`playbooks/04_k8s_node_prep.yml` is now k3s-specific prep: swap/zram,
+required kernel modules, Kubernetes sysctls, and persistent journald. It no
+longer installs/configures distro containerd because k3s owns embedded
+containerd.
 
 ## Node: k8s-node-01 (currently offline — hardware failure)
 
@@ -129,17 +131,13 @@ working state, kept for reference.
   build; patched to use the Docker-official `busybox:1.37.0` instead,
   which does.
 - **Local image registry:** `playbooks/06_riscv64_registry.yml` deploys a
-  riscv64 OCI registry (`registry:3.0.0` — `registry:2.x` has no riscv64
-  build, same check as `pause`) as a pod on this node's own standalone
-  k3s, reachable at `192.168.1.102:30500` (example — see IP note above)
-  from anywhere on the LAN. Exists
-  so future riscv64 nodes can pull already-built images (starting with
-  the hand-built `pause` image) instead of repeating the from-scratch
-  build/hand-roll process. Does **not** yet distinguish "registry host"
-  from "registry consumer" — running it against a second riscv64 node
-  as-is would deploy a second independent registry, not point that node
-  at this one; needs a small fix before a second riscv64 node is actually
-  onboarded. Full detail in `docs/2026-07-10-riscv64-local-registry.md`.
+  single shared riscv64 OCI registry (`registry:3.0.0` — `registry:2.x` has
+  no riscv64 build, same check as `pause`) on the `riscv64_registry_host`
+  inventory group, pins the pod to that node, and configures all
+  `riscv64_nodes` as consumers via `/etc/rancher/k3s/registries.yaml`.
+  The endpoint is derived from the registry host, not from each target host,
+  so running it with multiple nodes no longer creates independent registries.
+  Full detail in `docs/2026-07-10-riscv64-local-registry.md`.
 - **Traefik / ServiceLB / metrics-server:** all three were previously
   ImagePullBackOff on this board with no riscv64 build upstream — now
   fixed. `rancher/klipper-helm` (blocked Traefik's helm-install Jobs
@@ -196,8 +194,9 @@ host_vars/<hostname>.yml.example               - copy to <hostname>.yml (gitigno
 .env.example                                   - copy to .env (gitignored), set ANSIBLE_BECOME_PASSWORD to skip --ask-become-pass
 playbooks/00-04_*.yml                          - see plan doc below for the intended sequence
 playbooks/05_k3s_riscv64_build.yml             - build+install k3s from source on k8s-rv2-01, riscv64-only
-playbooks/06_riscv64_registry.yml              - local OCI registry on k8s-rv2-01 for riscv64 image distribution
+playbooks/06_riscv64_registry.yml              - shared riscv64 OCI registry host + consumer mirror config
 playbooks/11_riscv64_node_benchmark.yml        - CPU/memory/storage/network benchmark (sysbench+fio+iperf3, host + in-cluster), riscv64-only
+playbooks/14_k3s_riscv64_ha_servers.yml        - install/reconfigure three riscv64 k3s servers with embedded etcd
 benchmarks/results/                            - timestamped benchmark reports fetched back by playbook 11
 templates/static-ip.yaml.j2                    - netplan template for 02_base_config.yml
 templates/k3s-config.yaml.j2, k3s-registries.yaml.j2, riscv64-registry.yaml.j2
@@ -208,13 +207,14 @@ docs/                                          - incident logs / troubleshooting
                                                  (benchmarks.md history, spacemit-x60-*.md CPU feature/IME guides)
 ```
 
-`inventory.ini`, `host_vars/*.yml`, `group_vars/all/vault.yml`, `.vault_pass`,
-and `.claude/` are all gitignored — real host/IP/credential values never
-leave this machine. IPs shown elsewhere in this file and in `docs/` are
-placeholder examples, not the real LAN addresses.
+`inventory.ini`, `host_vars/*.yml`, `group_vars/all/vault.yml`,
+`group_vars/all/cluster.yml`, `.vault_pass`, and `.claude/` are all
+gitignored — real host/IP/credential values never leave this machine. IPs
+shown elsewhere in this file and in `docs/` are placeholder examples, not
+the real LAN addresses.
 
-No `roles/` — deliberately flat/minimal, now covering two nodes via
-`host_vars/` rather than per-node playbook copies.
+No `roles/` — deliberately flat/minimal, now covering the riscv64 HA nodes
+via inventory groups and `host_vars/` rather than per-node playbook copies.
 
 ## Known-bad path: `armbian-install` on boards with both eMMC and NVMe
 

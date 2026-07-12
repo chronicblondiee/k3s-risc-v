@@ -1,5 +1,5 @@
 ---
-- name: Container runtime and Kubernetes node prerequisites
+- name: k3s node prerequisites
   hosts: k8s_nodes
   become: true
   tasks:
@@ -64,31 +64,21 @@
         - { name: net.bridge.bridge-nf-call-ip6tables, value: "1" }
         - { name: net.ipv4.ip_forward, value: "1" }
 
-    - name: Install containerd from distro apt repo
-      ansible.builtin.apt:
-        name: containerd
-        state: present
-        update_cache: true
-
-    - name: Generate default containerd config
-      ansible.builtin.command: containerd config default
-      register: containerd_default_config
-      changed_when: false
-
-    - name: Write containerd config with SystemdCgroup enabled
-      ansible.builtin.copy:
-        content: "{{ containerd_default_config.stdout | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true') }}"
-        dest: /etc/containerd/config.toml
+    - name: Ensure persistent journald storage exists
+      ansible.builtin.file:
+        path: /var/log/journal
+        state: directory
         owner: root
-        group: root
-        mode: "0644"
-      notify: restart containerd
+        group: systemd-journal
+        mode: "2755"
+      notify: restart systemd-journald
 
-    - name: Ensure containerd is enabled and running
+    - name: Stop distro containerd if it is installed
       ansible.builtin.systemd:
         name: containerd
-        enabled: true
-        state: started
+        enabled: false
+        state: stopped
+      failed_when: false
 
   handlers:
     - name: restart armbian-zram-config
@@ -96,7 +86,7 @@
         name: armbian-zram-config
         state: restarted
 
-    - name: restart containerd
+    - name: restart systemd-journald
       ansible.builtin.systemd:
-        name: containerd
+        name: systemd-journald
         state: restarted

@@ -34,9 +34,9 @@ Pinned to `registry:3.0.0` (not `latest`) for reproducibility.
 
 ## Architecture
 
-Deployed as a pod **on the standalone k3s server itself**
-(`k8s-rv2-01`'s own cluster, built by `playbooks/05_k3s_riscv64_build.yml`)
-rather than as a bare systemd-managed container:
+Deployed as a pod on the host in the `riscv64_registry_host` inventory group
+(`k8s-rv2-01` in the current examples) rather than as a bare
+systemd-managed container:
 
 - Reuses `local-path-provisioner` for storage (already validated working
   as part of the base build) — a 4Gi PVC backed by `storageClassName:
@@ -45,6 +45,8 @@ rather than as a bare systemd-managed container:
   reachable from any host on the LAN at `<node-ip>:30500`, not just from
   pods inside this one node's cluster.
 - Namespace: `riscv64-registry` (dedicated, not `default`/`kube-system`).
+- The Deployment has a `kubernetes.io/hostname` nodeSelector so the
+  local-path PVC remains attached to the intended registry host.
 
 This deliberately dogfoods the cluster this repo just spent effort
 proving works, rather than adding a second, separately-maintained service
@@ -58,7 +60,7 @@ the playbook).
 
 ## containerd mirror configuration
 
-For any riscv64 node (including this one) to actually pull images
+For any riscv64 node (including the registry host itself) to actually pull images
 *through* this registry instead of going straight to the upstream
 registry, k3s's embedded containerd needs to know about it:
 `templates/k3s-registries.yaml.j2` renders
@@ -131,22 +133,11 @@ for any future playbook using `kubectl patch`.
 
 ## Open items / follow-ups
 
-- Only one riscv64 node exists right now, so "future nodes pull from
-  this" is unverified in practice — the mechanism (registries.yaml mirror
-  config) is standard containerd/k3s behavior, but hasn't been tested
-  against a second physical node yet.
-- `playbooks/06_riscv64_registry.yml` doesn't yet distinguish "the node
-  that hosts the registry" from "a node that should just consume it" — as
-  written, running it against a second riscv64 node would deploy a
-  *second*, independent registry pod there too, not point that node at
-  the existing one. Fine while there's only one riscv64 node; needs a
-  `registry_host`-style var (or splitting the playbook) before a second
-  node is actually onboarded.
+- The playbook now distinguishes the registry host from consumers, but the
+  multi-node pull path still needs validation against the second and third
+  physical RV2 boards once they are online.
 - No TLS, no auth on the registry — acceptable for a LAN-only home-lab
   registry holding nothing sensitive (just OCI images this repo already
   built or could rebuild), consistent with this repo's existing "POC, not
   hardened" vault posture. Revisit if this ever needs to be reachable
   beyond the home network.
-- `traefik`/`metrics-server` (still `ImagePullBackOff` per the main build
-  doc) haven't been rebuilt/pushed through this registry — nobody's
-  needed them yet.

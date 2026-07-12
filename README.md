@@ -1,16 +1,16 @@
 # k3s-risc-v
 
 Ansible-managed home Kubernetes lab that started ARM-only, then pivoted
-toward a mixed-architecture cluster by adding a riscv64 board. The original
+toward a mixed-architecture cluster by adding riscv64 boards. The original
 arm64 board is currently offline after a hardware failure, so the active
-scope is a standalone riscv64 k3s node (`k8s-rv2-01`). Target distribution is
-[k3s](https://k3s.io/) across the cluster — chosen because it's a single
-static binary and, unlike microk8s, has a real from-source path to riscv64.
+scope is riscv64-only: `k8s-rv2-01` plus planned `k8s-rv2-02` and
+`k8s-rv2-03` servers. Target distribution is [k3s](https://k3s.io/) across
+the cluster — chosen because it's a single static binary and, unlike
+microk8s, has a real from-source path to riscv64.
 
 The repository was formerly named `k8s-arm`; it is now `k3s-risc-v` to match
-the current k3s and RISC-V focus. The nodes are not joined into a mixed-arch
-cluster yet. See [Current status / future work](#current-status--future-work)
-below.
+the current k3s and RISC-V focus. The HA path is now automated for three
+riscv64 servers; mixed-architecture work remains future scope.
 
 See `AGENTS.md` for full node-by-node detail, hardware notes, and known
 gotchas (it's written for AI coding agents working in this repo, but is
@@ -22,7 +22,9 @@ specific incidents and builds.
 | Node | Board | Arch | OS | Status |
 |---|---|---|---|---|
 | `k8s-node-01` | Orange Pi 5 Plus (RK3588) | arm64 | Armbian, vendor kernel | **Offline — hardware failure** |
-| `k8s-rv2-01` | Orange Pi RV2 | riscv64 | Armbian, nightly/trunk | Active, standalone k3s |
+| `k8s-rv2-01` | Orange Pi RV2 | riscv64 | Armbian, nightly/trunk | Active, primary k3s server |
+| `k8s-rv2-02` | Orange Pi RV2 | riscv64 | Armbian, nightly/trunk | Planned HA server |
+| `k8s-rv2-03` | Orange Pi RV2 | riscv64 | Armbian, nightly/trunk | Planned HA server |
 
 ## Why this exists
 
@@ -49,16 +51,17 @@ sidecar for quantized LLM smoke inference.
 ansible.cfg, requirements.yml                  - Ansible project config
 inventory.ini.example                          - copy to inventory.ini (gitignored) with your own host/IP/user
 group_vars/all/vault.yml.example               - copy to vault.yml (gitignored), ansible-vault encrypt
+group_vars/all/cluster.yml.example             - copy to cluster.yml (gitignored), set k3s API DNS/VIP + release vars
 group_vars/all/local.yml                       - wires ANSIBLE_BECOME_PASSWORD env var to become password (see .env.example)
 host_vars/<hostname>.yml.example               - copy to <hostname>.yml (gitignored) with your own static IP/gateway
 .env.example                                   - copy to .env (gitignored), set ANSIBLE_BECOME_PASSWORD to skip --ask-become-pass
-playbooks/00_bootstrap_keys.yml                - deploy SSH key for the admin user (first run, password auth)
+playbooks/00_bootstrap_keys.yml                - create/bootstrap the admin user and deploy SSH key
 playbooks/01_nvme_install.yml                  - migrate SD boot to NVMe (DESTRUCTIVE, see docs/ incident report first)
 playbooks/02_base_config.yml                   - hostname, static IP, timezone, apt upgrade, password rotation
 playbooks/03_harden_ssh.yml                    - disable password auth and root SSH login
-playbooks/04_k8s_node_prep.yml                 - containerd/kubeadm-style node prep (needs review before use, see AGENTS.md)
+playbooks/04_k8s_node_prep.yml                 - k3s node prep: swap/zram, modules, sysctls, persistent journal
 playbooks/05_k3s_riscv64_build.yml             - build+install k3s from source on the riscv64 node, standalone
-playbooks/06_riscv64_registry.yml              - local OCI registry for riscv64 image distribution
+playbooks/06_riscv64_registry.yml              - shared OCI registry host + consumer mirror config for riscv64 nodes
 playbooks/07_riscv64_klipper_helm.yml          - rebuild rancher/klipper-helm for riscv64 (unblocks Traefik's helm-install jobs)
 playbooks/08_riscv64_klipper_lb.yml            - rebuild rancher/klipper-lb for riscv64 (unblocks svclb-* ServiceLB pods); also enables the docker.io mirror-with-fallback
 playbooks/09_riscv64_metrics_server.yml        - rebuild metrics-server for riscv64
@@ -66,6 +69,7 @@ playbooks/10_riscv64_local_path_busybox.yml    - durable (mirror-based) fix for 
 playbooks/11_riscv64_node_benchmark.yml        - host + in-cluster CPU/memory/storage/network benchmark for the riscv64 node
 playbooks/12_riscv64_ime_go_benchmark.yml      - copy/run the SpacemiT X60 IME Go proof and fetch benchmark reports
 playbooks/13_riscv64_llama_cpp_sidecar.yml     - build/deploy SpacemiT llama.cpp as an internal ClusterIP inference service
+playbooks/14_k3s_riscv64_ha_servers.yml        - install/reconfigure three riscv64 k3s servers with embedded etcd
 templates/                                     - Jinja2 templates rendered by the playbooks above
 files/                                         - static assets (hand-built riscv64 pause image source, generalized single-binary OCI image builder)
 tools/                                         - hardware-recovery build scripts and X60 IME Go proof tooling
@@ -92,16 +96,22 @@ and credentials. Set them up from the provided templates:
 cp inventory.ini.example inventory.ini
 cp host_vars/k8s-node-01.yml.example host_vars/k8s-node-01.yml
 cp host_vars/k8s-rv2-01.yml.example host_vars/k8s-rv2-01.yml
+cp host_vars/k8s-rv2-02.yml.example host_vars/k8s-rv2-02.yml
+cp host_vars/k8s-rv2-03.yml.example host_vars/k8s-rv2-03.yml
+cp group_vars/all/cluster.yml.example group_vars/all/cluster.yml
 cp group_vars/all/vault.yml.example group_vars/all/vault.yml
 # edit all of the above with your real hostnames/IPs/usernames, then:
 ansible-vault encrypt group_vars/all/vault.yml
 echo 'your-chosen-vault-password' > .vault_pass && chmod 600 .vault_pass
 ```
 
-Then run the playbooks in order for the target path you are provisioning
-(`00` through `06` for the base riscv64 k3s + registry path, then `07`-`10`
-for bundled k3s addon image gaps, and `11`-`13` for benchmarks/IME/llama.cpp
-as needed). See `AGENTS.md` for what each one does and the node-specific
+For the three-server riscv64 HA path, first create the real DNS/VIP named by
+`k3s_api_endpoint`, make sure all three RV2 boards are NVMe/SSD-rooted, then
+run `00` through `04`, `06`, `10`, and `14` in that order. `06` seeds the
+shared registry from the published riscv64 release artifacts before the new
+servers try to pull through it; `07`-`09` remain source-rebuild fallbacks if
+those artifacts are missing or stale. `11`-`13` are optional
+benchmarks/IME/llama.cpp workloads. See `AGENTS.md` for node-specific
 gotchas encountered along the way. Double-check
 `playbooks/01_nvme_install.yml` against `docs/2026-07-07-nvme-install-brick-and-recovery.md`
 before running it — it bricked a board once here.
@@ -155,11 +165,13 @@ including which operations are treated as destructive/hard-to-reverse
 
 - `k8s-node-01` (arm64) is offline due to a hardware failure. Future work:
   repair or replace it, add a new x86 node, and resume the
-  mixed-architecture cluster goal (the two/three nodes are currently run
-  and validated independently, not joined together).
-- `playbooks/06_riscv64_registry.yml` doesn't yet distinguish "the node
-  hosting the registry" from "a node that should just consume it" — needs
-  a small fix before a second riscv64 node is onboarded.
+  mixed-architecture cluster goal after the riscv64-only HA cluster is stable.
+- `playbooks/14_k3s_riscv64_ha_servers.yml` is the current onboarding path for
+  the two additional riscv64 servers. It requires a real `k3s_api_endpoint`
+  DNS/VIP and refuses to place embedded etcd on SD/MMC-rooted boards.
+- `playbooks/06_riscv64_registry.yml` now separates the single registry host
+  from registry consumers, pins the registry pod to the host node, and writes
+  the same mirror-with-fallback config on all riscv64 nodes.
 - `traefik` and `metrics-server` are now working on riscv64 — see
   `docs/2026-07-10-riscv64-traefik-metrics-server-fix.md`.
   `rancher/klipper-helm` (blocks Traefik's helm-install jobs) and

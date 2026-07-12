@@ -1,0 +1,461 @@
+---
+- name: Prepare riscv64 k3s server nodes
+  hosts: k3s_servers
+  become: true
+  vars:
+    k3s_user: "{{ ansible_user }}"
+    k3s_user_home: "/home/{{ k3s_user }}"
+    k3s_git_tag_effective: "{{ k3s_git_tag | default('v1.36.2+k3s1') }}"
+    k3s_riscv64_release_repo_effective: "{{ k3s_riscv64_release_repo | default('chronicblondiee/k3s-risc-v') }}"
+    k3s_riscv64_release_tag_effective: "{{ k3s_riscv64_release_tag | default('riscv64-v1.36.2-k3s1') }}"
+    k3s_riscv64_binary_asset_effective: "{{ k3s_riscv64_binary_asset | default('k3s-riscv64') }}"
+    k3s_release_download_base: "https://github.com/{{ k3s_riscv64_release_repo_effective }}/releases/download/{{ k3s_riscv64_release_tag_effective }}"
+    k3s_binary_url: "{{ k3s_release_download_base }}/{{ k3s_riscv64_binary_asset_effective }}"
+    k3s_binary_download_path: "/tmp/{{ k3s_riscv64_binary_asset_effective }}-{{ k3s_riscv64_release_tag_effective }}"
+    registry_host_name: "{{ groups[registry_host_group | default('riscv64_registry_host')][0] }}"
+    riscv64_registry_endpoint: "{{ hostvars[registry_host_name].ansible_facts.default_ipv4.address }}:{{ registry_node_port | default(30500) }}"
+    k3s_pause_image: "{{ riscv64_registry_endpoint }}/pause:riscv64-local"
+    k3s_helm_job_image: "{{ riscv64_registry_endpoint }}/klipper-helm:riscv64-local"
+    k3s_server_count: "{{ groups['k3s_servers'] | length }}"
+    k3s_single_node_mode: "{{ (groups['k3s_servers'] | length) == 1 }}"
+    k3s_state_backup_root: /var/lib/rancher/k3s/server/pre-etcd-backups
+    k3s_state_backup_dir: "{{ k3s_state_backup_root }}/{{ ansible_facts.date_time.iso8601_basic_short }}"
+  tasks:
+    - name: Abort unless the configured server topology is valid
+      ansible.builtin.assert:
+        that:
+          - k3s_server_count | int == 1 or (k3s_server_count | int >= 3 and (k3s_server_count | int) is odd)
+        fail_msg: >-
+          Configure exactly one k3s server for POC validation, or an odd
+          embedded-etcd HA server count of at least three. A two-server
+          control plane is not a safe final topology.
+
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_facts.architecture == "riscv64"
+        fail_msg: >-
+          This playbook installs the pinned riscv64 k3s artifact and should
+          only target riscv64 server nodes.
+
+    - name: Abort unless the HA API DNS or VIP endpoint is configured
+      ansible.builtin.assert:
+        that:
+          - k3s_api_endpoint is defined
+          - k3s_api_endpoint | length > 0
+          - k3s_api_endpoint != 'k3s.example.lan'
+        quiet: true
+        fail_msg: >-
+          Set k3s_api_endpoint in group_vars/all/cluster.yml to the real LAN
+          DNS name or VIP before joining HA servers.
+      when: not k3s_single_node_mode | bool
+
+    - name: Abort unless the root filesystem is on NVMe or SSD-class storage
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.mounts
+              | selectattr('mount', 'equalto', '/')
+              | map(attribute='device')
+              | first
+              | regex_search('^/dev/(nvme|mapper/|disk/by-id/)') is not none
+        fail_msg: >-
+          Refusing to place an embedded-etcd server on root device {{
+          ansible_facts.mounts | selectattr('mount', 'equalto', '/') | map(attribute='device') | first | default('unknown')
+          }}. Migrate this board to NVMe/SSD-backed root storage first.
+
+    - name: Ensure /etc/rancher/k3s exists
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check for existing k3s server datastore
+      ansible.builtin.stat:
+        path: /var/lib/rancher/k3s/server/db
+      register: k3s_existing_db
+
+    - name: Check for existing k3s server config
+      ansible.builtin.stat:
+        path: /etc/rancher/k3s/config.yaml
+      register: k3s_existing_config
+
+    - name: Check for existing k3s systemd unit
+      ansible.builtin.stat:
+        path: /etc/systemd/system/k3s.service
+      register: k3s_existing_unit
+
+    - name: Create k3s pre-conversion backup directory
+      ansible.builtin.file:
+        path: "{{ k3s_state_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: k3s_existing_db.stat.exists or k3s_existing_config.stat.exists or k3s_existing_unit.stat.exists
+
+    - name: Back up existing k3s config
+      ansible.builtin.copy:
+        remote_src: true
+        src: /etc/rancher/k3s/config.yaml
+        dest: "{{ k3s_state_backup_dir }}/config.yaml"
+        owner: root
+        group: root
+        mode: "0600"
+      when: k3s_existing_config.stat.exists
+
+    - name: Back up existing k3s systemd unit
+      ansible.builtin.copy:
+        remote_src: true
+        src: /etc/systemd/system/k3s.service
+        dest: "{{ k3s_state_backup_dir }}/k3s.service"
+        owner: root
+        group: root
+        mode: "0600"
+      when: k3s_existing_unit.stat.exists
+
+    - name: Back up existing k3s datastore
+      ansible.builtin.command: "cp -a /var/lib/rancher/k3s/server/db {{ k3s_state_backup_dir }}/db"
+      args:
+        creates: "{{ k3s_state_backup_dir }}/db"
+      when: k3s_existing_db.stat.exists
+
+    - name: Configure k3s containerd registry mirrors
+      ansible.builtin.template:
+        src: ../templates/k3s-registries.yaml.j2
+        dest: /etc/rancher/k3s/registries.yaml
+        owner: root
+        group: root
+        mode: "0644"
+      vars:
+        mirror_docker_io: true
+
+    - name: Download pinned riscv64 k3s artifact
+      ansible.builtin.get_url:
+        url: "{{ k3s_binary_url }}"
+        dest: "{{ k3s_binary_download_path }}"
+        mode: "0755"
+
+    - name: Verify the downloaded k3s artifact reports the expected version
+      ansible.builtin.command: "{{ k3s_binary_download_path }} --version"
+      register: k3s_download_version
+      changed_when: false
+
+    - name: Assert downloaded k3s binary matches the target git tag
+      ansible.builtin.assert:
+        that: k3s_git_tag_effective in k3s_download_version.stdout
+        fail_msg: "Downloaded k3s binary reports unexpected version: {{ k3s_download_version.stdout }}"
+
+    - name: Install k3s binary
+      ansible.builtin.copy:
+        remote_src: true
+        src: "{{ k3s_binary_download_path }}"
+        dest: /usr/local/bin/k3s
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install k3s server systemd unit
+      ansible.builtin.template:
+        src: ../templates/k3s.service.j2
+        dest: /etc/systemd/system/k3s.service
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Reload systemd after installing the k3s unit
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Symlink kubectl to the k3s multi-call binary
+      ansible.builtin.file:
+        src: /usr/local/bin/k3s
+        dest: /usr/local/bin/kubectl
+        state: link
+
+- name: Initialize the primary k3s embedded-etcd server
+  hosts: k3s_primary
+  become: true
+  vars:
+    k3s_user: "{{ ansible_user }}"
+    k3s_user_home: "/home/{{ k3s_user }}"
+    registry_host_name: "{{ groups[registry_host_group | default('riscv64_registry_host')][0] }}"
+    riscv64_registry_endpoint: "{{ hostvars[registry_host_name].ansible_facts.default_ipv4.address }}:{{ registry_node_port | default(30500) }}"
+    k3s_pause_image: "{{ riscv64_registry_endpoint }}/pause:riscv64-local"
+    k3s_helm_job_image: "{{ riscv64_registry_endpoint }}/klipper-helm:riscv64-local"
+    k3s_server_count: "{{ groups['k3s_servers'] | length }}"
+  tasks:
+    - name: Configure primary k3s server for embedded etcd
+      ansible.builtin.template:
+        src: ../templates/k3s-config.yaml.j2
+        dest: /etc/rancher/k3s/config.yaml
+        owner: root
+        group: root
+        mode: "0644"
+      vars:
+        k3s_node_name: "{{ node_hostname }}"
+        k3s_cluster_init: true
+      notify: restart k3s
+
+    - name: Ensure primary k3s server is enabled and started
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Flush handlers so primary config takes effect
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for primary node to report Ready
+      ansible.builtin.command: "/usr/local/bin/k3s kubectl get node {{ node_hostname }} --no-headers"
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: primary_ready_check
+      until: "'Ready' in primary_ready_check.stdout"
+      retries: 36
+      delay: 5
+      changed_when: false
+
+    - name: Recreate Traefik helm-install jobs with the configured riscv64 helm image
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n kube-system delete job
+        helm-install-traefik helm-install-traefik-crd --ignore-not-found
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: helm_job_delete
+      changed_when: "'deleted' in helm_job_delete.stdout"
+
+    - name: Wait for Traefik helm-install jobs to complete
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n kube-system get job
+        helm-install-traefik helm-install-traefik-crd
+        -o jsonpath={.items[*].status.succeeded}
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: helm_install_check
+      until: "helm_install_check.stdout.split() == ['1', '1']"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Read k3s server token for joining additional servers
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_server_token_raw
+      no_log: true
+
+    - name: Store k3s server token as a runtime fact
+      ansible.builtin.set_fact:
+        k3s_server_token: "{{ k3s_server_token_raw.content | b64decode | trim }}"
+      no_log: true
+
+    - name: Ensure {{ k3s_user }}'s ~/.kube directory exists
+      ansible.builtin.file:
+        path: "{{ k3s_user_home }}/.kube"
+        state: directory
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0700"
+
+    - name: Copy kubeconfig to {{ k3s_user }}'s home directory
+      ansible.builtin.copy:
+        remote_src: true
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "{{ k3s_user_home }}/.kube/config"
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0600"
+
+  handlers:
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+- name: Join additional riscv64 k3s servers
+  hosts: "k3s_servers:!k3s_primary"
+  become: true
+  vars:
+    k3s_user: "{{ ansible_user }}"
+    k3s_user_home: "/home/{{ k3s_user }}"
+    primary_host_name: "{{ groups['k3s_primary'][0] }}"
+    registry_host_name: "{{ groups[registry_host_group | default('riscv64_registry_host')][0] }}"
+    riscv64_registry_endpoint: "{{ hostvars[registry_host_name].ansible_facts.default_ipv4.address }}:{{ registry_node_port | default(30500) }}"
+    k3s_pause_image: "{{ riscv64_registry_endpoint }}/pause:riscv64-local"
+    k3s_helm_job_image: "{{ riscv64_registry_endpoint }}/klipper-helm:riscv64-local"
+  tasks:
+    - name: Configure joining k3s server
+      ansible.builtin.template:
+        src: ../templates/k3s-config.yaml.j2
+        dest: /etc/rancher/k3s/config.yaml
+        owner: root
+        group: root
+        mode: "0600"
+      vars:
+        k3s_node_name: "{{ node_hostname }}"
+        k3s_server_url: "https://{{ k3s_api_endpoint }}:{{ k3s_api_port | default(6443) }}"
+        k3s_token: "{{ hostvars[primary_host_name].k3s_server_token }}"
+      no_log: true
+      notify: restart k3s
+
+    - name: Ensure joining k3s server is enabled and started
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Flush handlers so join config takes effect
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for this server to report Ready via the primary kubeconfig
+      ansible.builtin.command: "/usr/local/bin/k3s kubectl get node {{ node_hostname }} --no-headers"
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      delegate_to: "{{ primary_host_name }}"
+      register: joined_ready_check
+      until: "'Ready' in joined_ready_check.stdout"
+      retries: 36
+      delay: 5
+      changed_when: false
+
+  handlers:
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+- name: Validate the configured k3s server control plane
+  hosts: k3s_primary
+  become: true
+  tasks:
+    - name: List k3s server nodes
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: k3s_nodes
+      changed_when: false
+
+    - name: Assert all configured servers are Ready
+      ansible.builtin.assert:
+        that:
+          - (hostvars[item].node_hostname | default(item)) in k3s_nodes.stdout
+          - "' Ready ' in k3s_nodes.stdout"
+        fail_msg: "Configured server {{ item }} is not Ready: {{ k3s_nodes.stdout }}"
+      loop: "{{ groups['k3s_servers'] }}"
+
+    - name: List non-running kube-system pods
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n kube-system get pods
+        --field-selector=status.phase!=Running,status.phase!=Succeeded
+        --no-headers
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: kube_system_non_running
+      failed_when: false
+      changed_when: false
+
+    - name: Assert kube-system has no active image pull failures
+      ansible.builtin.assert:
+        that:
+          - "'ImagePullBackOff' not in kube_system_non_running.stdout"
+          - "'ErrImagePull' not in kube_system_non_running.stdout"
+        fail_msg: "kube-system still has image pull failures: {{ kube_system_non_running.stdout_lines }}"
+
+    - name: Create validation namespace
+      ansible.builtin.command: /usr/local/bin/k3s kubectl create namespace k3s-validation
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: validation_namespace
+      failed_when:
+        - validation_namespace.rc != 0
+        - "'AlreadyExists' not in validation_namespace.stderr"
+      changed_when: validation_namespace.rc == 0
+
+    - name: Apply validation pods and PVC
+      ansible.builtin.command: /usr/local/bin/k3s kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: busybox-smoke
+            namespace: k3s-validation
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: busybox
+                image: busybox:1.37.0
+                command: ["sh", "-c", "sleep 300"]
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: pvc-smoke
+            namespace: k3s-validation
+          spec:
+            accessModes: [ReadWriteOnce]
+            resources:
+              requests:
+                storage: 64Mi
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: pvc-smoke
+            namespace: k3s-validation
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: busybox
+                image: busybox:1.37.0
+                command: ["sh", "-c", "echo pvc-ok > /data/result && sleep 300"]
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: pvc-smoke
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: validation_apply
+      changed_when: "'created' in validation_apply.stdout or 'configured' in validation_apply.stdout"
+
+    - name: Wait for validation pods to become Ready
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n k3s-validation wait
+        --for=condition=Ready pod/busybox-smoke pod/pvc-smoke --timeout=120s
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      changed_when: false
+
+    - name: Verify PVC-backed pod can read its mounted data
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n k3s-validation exec pvc-smoke --
+        cat /data/result
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: pvc_smoke_result
+      changed_when: false
+
+    - name: Assert PVC smoke output is correct
+      ansible.builtin.assert:
+        that: "'pvc-ok' in pvc_smoke_result.stdout"
+        fail_msg: "PVC smoke pod returned unexpected output: {{ pvc_smoke_result.stdout }}"
+
+    - name: Delete validation namespace
+      ansible.builtin.command: /usr/local/bin/k3s kubectl delete namespace k3s-validation --ignore-not-found
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: validation_namespace_delete
+      changed_when: "'deleted' in validation_namespace_delete.stdout"
+
+    - name: Show final server state
+      ansible.builtin.debug:
+        msg: "{{ k3s_nodes.stdout_lines }}"

@@ -21,14 +21,14 @@
 # fragile live "kubectl set image" patch needed, and it survives k3s
 # re-applying its bundled static manifest (same image ref either way).
 - name: Build a riscv64 metrics-server image
-  hosts: k8s_nodes
+  hosts: riscv64_registry_host
   become: true
   vars:
     k3s_user: "{{ ansible_user }}"
     k3s_user_home: "/home/{{ k3s_user }}"
     go_sdk_dir: "{{ k3s_user_home }}/sdk/go"
-    registry_node_port: 30500
-    registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
+    registry_host_name: "{{ groups[registry_host_group | default('riscv64_registry_host')][0] }}"
+    registry_endpoint: "{{ hostvars[registry_host_name].ansible_default_ipv4.address }}:{{ registry_node_port | default(30500) }}"
     # Must match the metrics-server image tag k3s's bundled addon manifest
     # actually references (check: kubectl -n kube-system get deploy
     # metrics-server -o jsonpath='{.spec.template.spec.containers[0].image}').

@@ -1,69 +1,92 @@
 ---
-# Deploys a local OCI image registry on the riscv64 build host so images
-# built/imported there (starting with the hand-built `pause` image from
-# 05_k3s_riscv64_build.yml) don't need re-building by hand on every future
-# riscv64 node - they get pulled from this registry instead.
-#
-# registry:2.x has no riscv64 build; registry:3.0.0 (the CNCF Distribution
-# v3 rewrite) does - checked directly the same way the pause-image gap was
-# checked, not assumed. See docs/2026-07-09-k3s-riscv64-source-build.md for
-# that precedent.
-#
-# Runs as a pod on the standalone k3s server built by 05_k3s_riscv64_build.yml
-# (reuses the already-validated local-path-provisioner for storage), NOT as
-# a bare container - deliberately dogfoods the cluster this repo just spent
-# effort proving works, rather than adding a separate systemd service to
-# maintain. Per standing project constraint this does not join any nodes
-# together - it's a plain single-node pod exposed via NodePort on the LAN.
-- name: Deploy a local riscv64 OCI registry and configure containerd to use it
-  hosts: k8s_nodes
+# Configures every riscv64 node to consume one shared LAN registry, then
+# deploys that registry exactly once on the designated registry host.
+- name: Configure riscv64 nodes to consume the shared local registry
+  hosts: riscv64_nodes
   become: true
   vars:
-    k3s_user: "{{ ansible_user }}"
-    k3s_user_home: "/home/{{ k3s_user }}"
-    registry_namespace: riscv64-registry
-    registry_image: "registry:3.0.0"
-    registry_storage_size: "4Gi"
-    registry_node_port: 30500
-    registry_endpoint: "{{ ansible_default_ipv4.address }}:{{ registry_node_port }}"
-    k3s_pause_image_ref: "localhost/pause:riscv64-local"
-
+    registry_host_name: "{{ groups[registry_host_group | default('riscv64_registry_host')][0] }}"
+    riscv64_registry_endpoint: "{{ hostvars[registry_host_name].ansible_facts.default_ipv4.address }}:{{ registry_node_port | default(30500) }}"
   tasks:
     - name: Abort if run against a non-riscv64 host
       ansible.builtin.assert:
-        that: ansible_architecture == "riscv64"
-        fail_msg: >-
-          This registry is specifically for riscv64 image distribution.
-          Target it explicitly, e.g. --limit k8s-rv2-01.
+        that: ansible_facts.architecture == "riscv64"
+        fail_msg: "This registry mirror config is for riscv64 nodes only."
 
-    # --- Point this node's own containerd at the registry (as mirror) --------
-    # An http:// endpoint here is what tells containerd this is a plain-HTTP
-    # registry (no TLS at all) - there's deliberately no cert/insecure-skip
-    # config, since there's no TLS in play to begin with for this home-lab
-    # registry.
-    - name: Configure k3s containerd to use the riscv64 registry as a mirror
+    - name: Ensure /etc/rancher/k3s exists
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure k3s containerd to use the shared riscv64 registry
       ansible.builtin.template:
         src: ../templates/k3s-registries.yaml.j2
         dest: /etc/rancher/k3s/registries.yaml
         owner: root
         group: root
         mode: "0644"
+      vars:
+        mirror_docker_io: true
       notify: restart k3s
 
-    - name: Flush handlers so registries.yaml takes effect before the registry pod is deployed
-      ansible.builtin.meta: flush_handlers
+  handlers:
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        daemon_reload: true
+        enabled: true
+        state: restarted
+      failed_when: false
 
-    - name: Wait for node to report Ready after any restart
-      ansible.builtin.command: /usr/local/bin/k3s kubectl get node --no-headers
-      environment:
-        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-      register: node_ready_check
-      until: "'Ready' in node_ready_check.stdout"
-      retries: 24
-      delay: 5
-      changed_when: false
+- name: Deploy and seed the shared riscv64 OCI registry
+  hosts: riscv64_registry_host
+  become: true
+  vars:
+    k3s_user: "{{ ansible_user }}"
+    k3s_user_home: "/home/{{ k3s_user }}"
+    registry_namespace_effective: "{{ registry_namespace | default('riscv64-registry') }}"
+    registry_image_effective: "{{ registry_image | default('registry:3.0.0') }}"
+    registry_storage_size_effective: "{{ registry_storage_size | default('4Gi') }}"
+    registry_host_name: "{{ inventory_hostname }}"
+    registry_node_port_effective: "{{ registry_node_port | default(30500) }}"
+    riscv64_registry_endpoint: "{{ ansible_facts.default_ipv4.address }}:{{ registry_node_port_effective }}"
+    k3s_pause_image_ref: "localhost/pause:riscv64-local"
+    k3s_release_download_base: "https://github.com/{{ k3s_riscv64_release_repo | default('chronicblondiee/k3s-risc-v') }}/releases/download/{{ k3s_riscv64_release_tag | default('riscv64-v1.36.2-k3s1') }}"
+    registry_seed_dir: "{{ k3s_user_home }}/riscv64-release-images"
+    registry_seed_images:
+      - name: pause
+        asset: pause-riscv64.oci.tar
+        source_ref: localhost/pause:riscv64-local
+        ref: "{{ riscv64_registry_endpoint }}/pause:riscv64-local"
+        verify_url: "http://{{ riscv64_registry_endpoint }}/v2/pause/tags/list"
+        verify_tag: riscv64-local
+      - name: klipper-helm
+        asset: klipper-helm-riscv64.oci.tar
+        source_ref: localhost/klipper-helm:riscv64-local
+        ref: "{{ riscv64_registry_endpoint }}/klipper-helm:riscv64-local"
+        verify_url: "http://{{ riscv64_registry_endpoint }}/v2/klipper-helm/tags/list"
+        verify_tag: riscv64-local
+      - name: klipper-lb
+        asset: klipper-lb-riscv64.oci.tar
+        source_ref: localhost/klipper-lb:v0.4.17
+        ref: "{{ riscv64_registry_endpoint }}/rancher/klipper-lb:v0.4.17"
+        verify_url: "http://{{ riscv64_registry_endpoint }}/v2/rancher/klipper-lb/tags/list"
+        verify_tag: v0.4.17
+      - name: metrics-server
+        asset: metrics-server-riscv64.oci.tar
+        source_ref: localhost/metrics-server:v0.8.1
+        ref: "{{ riscv64_registry_endpoint }}/rancher/mirrored-metrics-server:v0.8.1"
+        verify_url: "http://{{ riscv64_registry_endpoint }}/v2/rancher/mirrored-metrics-server/tags/list"
+        verify_tag: v0.8.1
+  tasks:
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_facts.architecture == "riscv64"
+        fail_msg: "The shared registry host must be riscv64 for this repo's current image path."
 
-    # --- Deploy the registry itself as a pod on this node's own k3s ----------
     - name: Render riscv64 registry manifest
       ansible.builtin.template:
         src: ../templates/riscv64-registry.yaml.j2
@@ -71,6 +94,8 @@
         owner: "{{ k3s_user }}"
         group: "{{ k3s_user }}"
         mode: "0644"
+      vars:
+        registry_node_name: "{{ node_hostname }}"
       become: false
       register: registry_manifest
 
@@ -84,58 +109,74 @@
 
     - name: Wait for registry deployment rollout
       ansible.builtin.command: >-
-        kubectl -n {{ registry_namespace }} rollout status deployment/riscv64-registry --timeout=120s
+        kubectl -n {{ registry_namespace_effective }} rollout status deployment/riscv64-registry --timeout=120s
       environment:
         KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
       become: false
       changed_when: false
 
-    # --- Push what we've already built into it --------------------------------
-    - name: Check whether the pause image is already present in the registry
+    - name: Ensure release image cache directory exists
+      ansible.builtin.file:
+        path: "{{ registry_seed_dir }}"
+        state: directory
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0755"
+
+    - name: Check whether each release image is already present in the registry
       ansible.builtin.uri:
-        url: "http://{{ registry_endpoint }}/v2/pause/tags/list"
+        url: "{{ item.verify_url }}"
         status_code: [200, 404]
-      register: pause_registry_check
-
-    - name: Tag the local pause image for the registry
-      ansible.builtin.command: >-
-        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
-        images tag {{ k3s_pause_image_ref }} {{ registry_endpoint }}/pause:riscv64-local
-      when: pause_registry_check.status == 404
-      changed_when: true
-
-    - name: Push the pause image into the local registry
-      ansible.builtin.command: >-
-        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
-        images push --plain-http {{ registry_endpoint }}/pause:riscv64-local
-      when: pause_registry_check.status == 404
-      changed_when: true
-
-    # --- Prove the round trip actually works, not just that push succeeded ---
-    - name: Verify the registry serves back what was pushed
-      ansible.builtin.uri:
-        url: "http://{{ registry_endpoint }}/v2/pause/tags/list"
         return_content: true
-      register: pause_registry_verify
+      loop: "{{ registry_seed_images }}"
+      register: registry_seed_checks
 
-    - name: Assert the pushed tag is visible in the registry catalog
+    - name: Download missing release OCI image archives
+      ansible.builtin.get_url:
+        url: "{{ k3s_release_download_base }}/{{ item.item.asset }}"
+        dest: "{{ registry_seed_dir }}/{{ item.item.asset }}"
+        mode: "0644"
+      loop: "{{ registry_seed_checks.results }}"
+      when: item.status == 404 or item.item.verify_tag not in (item.content | default(''))
+      become: false
+
+    - name: Import missing release OCI image archives into k3s containerd
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images import {{ registry_seed_dir }}/{{ item.item.asset }}
+      loop: "{{ registry_seed_checks.results }}"
+      when: item.status == 404 or item.item.verify_tag not in (item.content | default(''))
+      changed_when: true
+
+    - name: Tag missing release images for the shared registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images tag {{ item.item.source_ref }} {{ item.item.ref }}
+      loop: "{{ registry_seed_checks.results }}"
+      when: item.status == 404 or item.item.verify_tag not in (item.content | default(''))
+      changed_when: true
+
+    - name: Push missing release images into the shared registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images push --plain-http {{ item.item.ref }}
+      loop: "{{ registry_seed_checks.results }}"
+      when: item.status == 404 or item.item.verify_tag not in (item.content | default(''))
+      changed_when: true
+
+    - name: Verify all seeded image tags are visible in the registry
+      ansible.builtin.uri:
+        url: "{{ item.verify_url }}"
+        return_content: true
+      loop: "{{ registry_seed_images }}"
+      register: registry_seed_verify
+
+    - name: Assert all expected image tags are visible
       ansible.builtin.assert:
-        that: "'riscv64-local' in pause_registry_verify.content"
-        fail_msg: "Registry does not report the pushed pause tag: {{ pause_registry_verify.content }}"
+        that: "item.item.verify_tag in item.content"
+        fail_msg: "Registry does not report expected tag {{ item.item.verify_tag }}: {{ item.content }}"
+      loop: "{{ registry_seed_verify.results }}"
 
     - name: Report registry endpoint for operator reference
       ansible.builtin.debug:
-        msg: >-
-          riscv64 registry reachable at http://{{ registry_endpoint }} -
-          future riscv64 nodes should get the same
-          templates/k3s-registries.yaml.j2 config (this playbook, run
-          against them) to pull through it instead of rebuilding images by
-          hand.
-
-  handlers:
-    - name: restart k3s
-      ansible.builtin.systemd:
-        name: k3s
-        daemon_reload: true
-        enabled: true
-        state: restarted
+        msg: "Shared riscv64 registry reachable at http://{{ riscv64_registry_endpoint }}."

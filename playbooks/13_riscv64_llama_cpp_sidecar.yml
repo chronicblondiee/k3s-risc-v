@@ -9,8 +9,8 @@
   vars:
     k3s_user: "{{ ansible_user }}"
     k3s_user_home: "/home/{{ k3s_user }}"
-    registry_node_port: 30500
-    registry_endpoint: "{{ ansible_facts.default_ipv4.address }}:{{ registry_node_port }}"
+    registry_host_name: "{{ groups[registry_host_group | default('riscv64_registry_host')][0] }}"
+    registry_endpoint: "{{ hostvars[registry_host_name].ansible_default_ipv4.address }}:{{ registry_node_port | default(30500) }}"
 
     llama_cpp_namespace: riscv64-llm
     llama_cpp_app: spacemit-llama-cpp

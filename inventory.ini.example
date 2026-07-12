@@ -1,6 +1,19 @@
-[k8s_nodes]
-k8s-node-01 ansible_host=192.168.1.101
+[k3s_primary]
 k8s-rv2-01 ansible_host=192.168.1.102
+
+[k3s_servers]
+k8s-rv2-01
+k8s-rv2-02 ansible_host=192.168.1.103
+k8s-rv2-03 ansible_host=192.168.1.104
+
+[riscv64_registry_host]
+k8s-rv2-01
+
+[riscv64_nodes:children]
+k3s_servers
+
+[k8s_nodes:children]
+k3s_servers
 
 [k8s_nodes:vars]
 ansible_user=your_username

@@ -1,25 +1,25 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: {{ registry_namespace }}
+  name: {{ registry_namespace_effective }}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: riscv64-registry-data
-  namespace: {{ registry_namespace }}
+  namespace: {{ registry_namespace_effective }}
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: local-path
   resources:
     requests:
-      storage: {{ registry_storage_size }}
+      storage: {{ registry_storage_size_effective }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: riscv64-registry
-  namespace: {{ registry_namespace }}
+  namespace: {{ registry_namespace_effective }}
 spec:
   replicas: 1
   strategy:
@@ -32,9 +32,11 @@ spec:
       labels:
         app: riscv64-registry
     spec:
+      nodeSelector:
+        kubernetes.io/hostname: {{ registry_node_name }}
       containers:
         - name: registry
-          image: {{ registry_image }}
+          image: {{ registry_image_effective }}
           ports:
             - containerPort: 5000
           volumeMounts:
@@ -49,7 +51,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: riscv64-registry
-  namespace: {{ registry_namespace }}
+  namespace: {{ registry_namespace_effective }}
 spec:
   type: NodePort
   selector:
@@ -57,4 +59,4 @@ spec:
   ports:
     - port: 5000
       targetPort: 5000
-      nodePort: {{ registry_node_port }}
+      nodePort: {{ registry_node_port_effective }}

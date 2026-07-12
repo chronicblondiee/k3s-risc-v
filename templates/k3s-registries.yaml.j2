@@ -1,7 +1,7 @@
 mirrors:
-  "{{ registry_endpoint }}":
+  "{{ riscv64_registry_endpoint | default(registry_endpoint) }}":
     endpoint:
-      - "http://{{ registry_endpoint }}"
+      - "http://{{ riscv64_registry_endpoint | default(registry_endpoint) }}"
 {% if mirror_docker_io | default(false) %}
   # Some rancher/* system images k3s references internally (klipper-lb,
   # potentially others) have no dedicated k3s server flag to override
@@ -18,6 +18,6 @@ mirrors:
   # mirror substitutes only the host, not the path.
   "docker.io":
     endpoint:
-      - "http://{{ registry_endpoint }}"
+      - "http://{{ riscv64_registry_endpoint | default(registry_endpoint) }}"
       - "https://registry-1.docker.io"
 {% endif %}

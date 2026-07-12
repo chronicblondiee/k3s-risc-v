@@ -1,0 +1,4 @@
+---
+node_hostname: k8s-rv2-02
+static_ip: 192.168.1.103/24
+gateway_ip: 192.168.1.1
