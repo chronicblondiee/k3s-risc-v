@@ -1,16 +1,16 @@
-# k8s-risc-v
+# k3s-risc-v
 
-Ansible-managed home Kubernetes lab spanning two architectures: an arm64
-board (Orange Pi 5 Plus, RK3588) and a riscv64 board (Orange Pi RV2), both
-running Armbian. Target distribution is [k3s](https://k3s.io/) across the
-whole cluster — chosen because it's a single static binary and, unlike
-microk8s, has a real (if from-source) path to a riscv64 build.
+Ansible-managed home Kubernetes lab that started ARM-only, then pivoted
+toward a mixed-architecture cluster by adding a riscv64 board. The original
+arm64 board is currently offline after a hardware failure, so the active
+scope is a standalone riscv64 k3s node (`k8s-rv2-01`). Target distribution is
+[k3s](https://k3s.io/) across the cluster — chosen because it's a single
+static binary and, unlike microk8s, has a real from-source path to riscv64.
 
-Started arm64-only (repo name predates the RISC-V addition); the two nodes
-are run and validated independently, not yet joined into a single
-multi-node cluster. **The arm64 board is currently offline (hardware
-failure)** — active focus is riscv64-only for now. See
-[Current status / future work](#current-status--future-work) below.
+The repository was formerly named `k8s-arm`; it is now `k3s-risc-v` to match
+the current k3s and RISC-V focus. The nodes are not joined into a mixed-arch
+cluster yet. See [Current status / future work](#current-status--future-work)
+below.
 
 See `AGENTS.md` for full node-by-node detail, hardware notes, and known
 gotchas (it's written for AI coding agents working in this repo, but is
@@ -37,6 +37,12 @@ every command run, and the reasoning behind each decision (e.g. why native
 on-board build over cross-compiling, why `registry:3.0.0` over `2.x` for
 the local image registry in `docs/2026-07-10-riscv64-local-registry.md`).
 
+The same pattern now covers the rest of the single-node riscv64 stack:
+Traefik's `klipper-helm`, ServiceLB's `klipper-lb`, metrics-server,
+local-path-provisioner's helper busybox image, host/in-cluster benchmarking,
+SpacemiT X60 IME proof tooling, and an internal SpacemiT `llama.cpp` HTTP
+sidecar for quantized LLM smoke inference.
+
 ## Repo layout
 
 ```
@@ -57,9 +63,13 @@ playbooks/07_riscv64_klipper_helm.yml          - rebuild rancher/klipper-helm fo
 playbooks/08_riscv64_klipper_lb.yml            - rebuild rancher/klipper-lb for riscv64 (unblocks svclb-* ServiceLB pods); also enables the docker.io mirror-with-fallback
 playbooks/09_riscv64_metrics_server.yml        - rebuild metrics-server for riscv64
 playbooks/10_riscv64_local_path_busybox.yml    - durable (mirror-based) fix for local-path-provisioner's busybox image, replacing the fragile live-patch approach
+playbooks/11_riscv64_node_benchmark.yml        - host + in-cluster CPU/memory/storage/network benchmark for the riscv64 node
+playbooks/12_riscv64_ime_go_benchmark.yml      - copy/run the SpacemiT X60 IME Go proof and fetch benchmark reports
+playbooks/13_riscv64_llama_cpp_sidecar.yml     - build/deploy SpacemiT llama.cpp as an internal ClusterIP inference service
 templates/                                     - Jinja2 templates rendered by the playbooks above
 files/                                         - static assets (hand-built riscv64 pause image source, generalized single-binary OCI image builder)
-tools/                                         - hardware-recovery build scripts (RK3588 Maskrom recovery)
+tools/                                         - hardware-recovery build scripts and X60 IME Go proof tooling
+benchmarks/results/                            - fetched benchmark reports from playbooks 11/12
 docs/                                          - incident logs / troubleshooting runbooks
 ```
 
@@ -88,9 +98,11 @@ ansible-vault encrypt group_vars/all/vault.yml
 echo 'your-chosen-vault-password' > .vault_pass && chmod 600 .vault_pass
 ```
 
-Then run the playbooks in order (`00` through `06`, skipping any that don't
-apply to your hardware) — see `AGENTS.md` for what each one does and the
-node-specific gotchas encountered along the way. Double-check
+Then run the playbooks in order for the target path you are provisioning
+(`00` through `06` for the base riscv64 k3s + registry path, then `07`-`10`
+for bundled k3s addon image gaps, and `11`-`13` for benchmarks/IME/llama.cpp
+as needed). See `AGENTS.md` for what each one does and the node-specific
+gotchas encountered along the way. Double-check
 `playbooks/01_nvme_install.yml` against `docs/2026-07-07-nvme-install-brick-and-recovery.md`
 before running it — it bricked a board once here.
 
@@ -159,6 +171,20 @@ including which operations are treated as destructive/hard-to-reverse
   artifacts for all of these (plus k3s and pause) are published at
   [releases/riscv64-v1.36.2-k3s1](https://github.com/chronicblondiee/k3s-risc-v/releases/tag/riscv64-v1.36.2-k3s1)
   for quick re-provisioning without repeating the from-source builds.
+- `playbooks/11_riscv64_node_benchmark.yml` records host and in-cluster
+  benchmark results under `benchmarks/results/`; keep those separate from
+  the IME-specific reports.
+- `tools/x60-ime-go` and `playbooks/12_riscv64_ime_go_benchmark.yml` prove
+  the SpacemiT X60 IME `vmadot` instructions can be driven from Go+cgo and
+  now include matrix-shaped tiling benchmarks. This remains a proof/benchmark
+  harness, not the production inference path.
+- `playbooks/13_riscv64_llama_cpp_sidecar.yml` is the recommended path for
+  real quantized LLM inference on the riscv64 node. It builds SpacemiT's
+  `llama.cpp` runtime into the local registry, deploys it as a ClusterIP-only
+  service, and validates `/health` plus `/v1/chat/completions`. See
+  `docs/2026-07-12-riscv64-llama-cpp-sidecar.md` for the full troubleshooting
+  record: corrected model URL, SpacemiT ONNX runtime dependency, same-tag
+  image refresh, and `SPACEMIT_MEM_BACKEND=POSIX`.
 
 ## License
 
