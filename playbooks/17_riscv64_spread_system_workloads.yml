@@ -1,0 +1,77 @@
+---
+# Spread only lightweight stateless system workloads. Storage-bound or
+# intentionally singleton components (metrics-server, local-path-provisioner,
+# the local registry, and LLM workloads) are left untouched.
+- name: Spread lightweight kube-system workloads across riscv64 servers
+  hosts: k3s_primary
+  become: true
+  vars:
+    system_workload_spread_patches:
+      - name: coredns
+        namespace: kube-system
+        selector:
+          k8s-app: kube-dns
+      - name: traefik
+        namespace: kube-system
+        selector:
+          app.kubernetes.io/name: traefik
+  tasks:
+    - name: Abort unless at least two k3s servers are configured
+      ansible.builtin.assert:
+        that: groups['k3s_servers'] | length >= 2
+        fail_msg: "At least two k3s_servers are required before spreading replicas."
+
+    - name: Scale CoreDNS and Traefik to two replicas with node spread preferences
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - -n
+          - "{{ item.namespace }}"
+          - patch
+          - deployment
+          - "{{ item.name }}"
+          - --type
+          - merge
+          - -p
+          - "{{ lookup('template', '../templates/system-workload-spread-patch.json.j2') }}"
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      loop: "{{ system_workload_spread_patches }}"
+      register: system_workload_patch
+      changed_when: "'patched' in system_workload_patch.stdout"
+
+    - name: Wait for CoreDNS and Traefik rollouts
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n {{ item.namespace }}
+        rollout status deployment/{{ item.name }} --timeout=180s
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      loop: "{{ system_workload_spread_patches }}"
+      changed_when: false
+
+    - name: Read scheduled nodes for CoreDNS and Traefik replicas
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n {{ item.namespace }} get pods
+        -l {{ item.selector | dict2items | map(attribute='key') | first }}={{ item.selector | dict2items | map(attribute='value') | first }}
+        -o jsonpath={.items[*].spec.nodeName}
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      loop: "{{ system_workload_spread_patches }}"
+      register: system_workload_nodes
+      changed_when: false
+
+    - name: Assert each lightweight workload has two replicas on at least two nodes
+      ansible.builtin.assert:
+        that:
+          - item.stdout.split() | length >= 2
+          - item.stdout.split() | unique | length >= 2
+        fail_msg: >-
+          {{ item.item.name }} is not spread across at least two nodes:
+          {{ item.stdout.split() }}.
+      loop: "{{ system_workload_nodes.results }}"
+
+    - name: Report spread system workloads
+      ansible.builtin.debug:
+        msg: "{{ item.item.name }} scheduled on {{ item.stdout.split() | unique }}"
+      loop: "{{ system_workload_nodes.results }}"

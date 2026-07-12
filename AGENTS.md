@@ -12,19 +12,26 @@ cluster goal is now three riscv64 k3s server nodes (`k8s-rv2-01`,
 the arm64 node and add a new x86 node, resuming the mixed-architecture goal.
 Until then, no mixed-arch work is in scope.
 
-**Status as of 2026-07-12: the three-server riscv64 HA control plane is
-live, with a real floating VIP.** `k8s-rv2-02` and `k8s-rv2-03` joined
+**Status as of 2026-07-13: the three-server riscv64 HA control plane is
+live, with a real floating VIP and follow-up hardening applied.** `k8s-rv2-02` and `k8s-rv2-03` joined
 `k8s-rv2-01` via `playbooks/14_k3s_riscv64_ha_servers.yml`; all three report
 `Ready` with `control-plane,etcd` roles. `k3s_api_endpoint`
 (`k3s.home.arpa`) is backed by a `keepalived` VIP (`192.168.1.83`, via
 `playbooks/15_riscv64_ha_vip.yml`) that automatically moves to a healthy
 server if the current holder goes down — verified with a live failover
-test. See `docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md` for the join
-process and a board-identity gotcha worth reading before touching these
-nodes again (verify by NIC MAC against the router's DHCP reservations, not
-by whatever IP a board currently answers on), and
+test. Follow-up hardening pins k3s node networking to inventory addresses,
+uses an authenticated `/readyz` keepalived check, preloads critical riscv64
+system image refs on every server, spreads CoreDNS and Traefik to two
+replicas, re-enables SSH host-key checking with a repo-local gitignored
+`known_hosts`, and captures etcd plus registry/LLM local-path PV backups
+under gitignored `backups/`. See
+`docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md` for the join process
+and a board-identity gotcha worth reading before touching these nodes again
+(verify by NIC MAC against the router's DHCP reservations, not by whatever
+IP a board currently answers on),
 `docs/2026-07-12-riscv64-k3s-ha-vip.md` for the VIP design, the `/readyz`
-401-on-anonymous-request gotcha, and the failover test.
+401-on-anonymous-request gotcha, and the failover test, and
+`docs/2026-07-13-riscv64-ha-hardening.md` for the hardening validation.
 
 ## Target k8s distribution: k3s (cluster-wide decision)
 
@@ -212,7 +219,14 @@ playbooks/06_riscv64_registry.yml              - shared riscv64 OCI registry hos
 playbooks/11_riscv64_node_benchmark.yml        - CPU/memory/storage/network benchmark (sysbench+fio+iperf3, host + in-cluster), riscv64-only
 playbooks/14_k3s_riscv64_ha_servers.yml        - install/reconfigure three riscv64 k3s servers with embedded etcd
 playbooks/15_riscv64_ha_vip.yml                - keepalived VIP for k3s_api_endpoint, real automatic failover
+playbooks/16_riscv64_preload_critical_images.yml
+                                                - preload/tag critical riscv64 system images on every server
+playbooks/17_riscv64_spread_system_workloads.yml
+                                                - two replicas + node spread for CoreDNS and Traefik only
+playbooks/18_riscv64_backup_cluster_state.yml   - etcd snapshot + registry/LLM local-path PV archives fetched to backups/
+playbooks/19_refresh_known_hosts.yml            - refresh repo-local known_hosts after node identity confirmation
 benchmarks/results/                            - timestamped benchmark reports fetched back by playbook 11
+backups/                                       - gitignored backup captures from playbook 18
 templates/static-ip.yaml.j2                    - netplan template for 02_base_config.yml
 templates/k3s-config.yaml.j2, k3s-registries.yaml.j2, riscv64-registry.yaml.j2
                                                 - k3s/registry config for 05/06 (see those playbooks + docs/)
@@ -223,7 +237,7 @@ docs/                                          - incident logs / troubleshooting
 ```
 
 `inventory.ini`, `host_vars/*.yml`, `group_vars/all/vault.yml`,
-`group_vars/all/cluster.yml`, `.vault_pass`, and `.claude/` are all
+`group_vars/all/cluster.yml`, `.vault_pass`, `known_hosts`, `backups/`, and `.claude/` are all
 gitignored — real host/IP/credential values never leave this machine. IPs
 shown elsewhere in this file and in `docs/` are placeholder examples, not
 the real LAN addresses.

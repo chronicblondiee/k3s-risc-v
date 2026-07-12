@@ -1,0 +1,44 @@
+---
+# Use after board identity has been confirmed against the router's DHCP
+# reservations. This writes stable host keys for the inventory hostnames and
+# addresses into the repo-local known_hosts file, which is gitignored.
+- name: Refresh repo-local SSH known_hosts for confirmed cluster nodes
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    known_hosts_path: "{{ playbook_dir }}/../known_hosts"
+    known_hosts_scan_targets: >-
+      {{
+        groups['k3s_servers']
+        | map('extract', hostvars, 'ansible_host')
+        | list
+      }}
+  tasks:
+    - name: Ensure repo-local known_hosts file exists with private permissions
+      ansible.builtin.file:
+        path: "{{ known_hosts_path }}"
+        state: touch
+        mode: "0600"
+
+    - name: Scan current host keys for confirmed node identities
+      ansible.builtin.command: "ssh-keyscan -T 5 {{ item }}"
+      loop: "{{ known_hosts_scan_targets | unique }}"
+      register: known_hosts_scans
+      changed_when: false
+      failed_when: false
+
+    - name: Install scanned host keys into repo-local known_hosts
+      ansible.builtin.known_hosts:
+        path: "{{ known_hosts_path }}"
+        name: "{{ item.0.item }}"
+        key: "{{ item.1 }}"
+        state: present
+      loop: "{{ known_hosts_scans.results | subelements('stdout_lines') }}"
+      when: item.1 is match('^' ~ (item.0.item | regex_escape) ~ '\\s+')
+
+    - name: Assert all inventory connection addresses have host keys
+      ansible.builtin.assert:
+        that: item.rc == 0 and (item.stdout_lines | length > 0)
+        fail_msg: "Could not scan an SSH host key for {{ item.item }}."
+      loop: "{{ known_hosts_scans.results }}"

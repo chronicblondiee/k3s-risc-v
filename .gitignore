@@ -3,6 +3,7 @@ group_vars/all/cluster.yml
 *.retry
 .vault_pass
 log/
+backups/
 tools/rkdeveloptool/
 tools/rkbin/
 inventory.ini

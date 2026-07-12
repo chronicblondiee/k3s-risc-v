@@ -1,0 +1,236 @@
+---
+# Captures an etcd snapshot plus local-path PV data for the local registry
+# and LLM model workloads. Archives are fetched to local gitignored backups/.
+- name: Capture etcd snapshot and discover PVs to back up
+  hosts: k3s_primary
+  become: true
+  vars:
+    backup_id: "{{ ansible_facts.date_time.iso8601_basic_short }}"
+    remote_backup_dir: "/var/lib/rancher/k3s/server/backup-captures/{{ backup_id }}"
+    local_backup_dir: "{{ playbook_dir }}/../backups/{{ backup_id }}"
+    backup_pvc_targets:
+      - name: registry
+        namespace: "{{ registry_namespace | default('riscv64-registry') }}"
+      - name: llm-models
+        namespace: "{{ riscv64_llm_namespace | default('riscv64-llm') }}"
+  tasks:
+    - name: Publish backup ID for later plays
+      ansible.builtin.set_fact:
+        cluster_backup_id: "{{ backup_id }}"
+        cluster_local_backup_dir: "{{ local_backup_dir }}"
+
+    - name: Ensure remote backup staging directory exists
+      ansible.builtin.file:
+        path: "{{ remote_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Save an etcd snapshot
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s etcd-snapshot save
+        --name {{ inventory_hostname }}-{{ backup_id }}
+      register: etcd_snapshot_save
+      changed_when: "'Snapshot saved' in etcd_snapshot_save.stdout or etcd_snapshot_save.rc == 0"
+
+    - name: Locate the saved etcd snapshot
+      ansible.builtin.find:
+        paths: /var/lib/rancher/k3s/server/db/snapshots
+        patterns: "{{ inventory_hostname }}-{{ backup_id }}*"
+        file_type: file
+      register: etcd_snapshot_files
+
+    - name: Assert exactly one etcd snapshot was created
+      ansible.builtin.assert:
+        that: etcd_snapshot_files.files | length == 1
+        fail_msg: "Expected one etcd snapshot for {{ backup_id }}, found {{ etcd_snapshot_files.files | length }}."
+
+    - name: Copy etcd snapshot into the backup staging directory
+      ansible.builtin.copy:
+        remote_src: true
+        src: "{{ etcd_snapshot_files.files[0].path }}"
+        dest: "{{ remote_backup_dir }}/{{ etcd_snapshot_files.files[0].path | basename }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Read PVCs for registry and LLM namespaces
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - -n
+          - "{{ item.namespace }}"
+          - get
+          - pvc
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.volumeName}{"\n"}{end}'
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      loop: "{{ backup_pvc_targets }}"
+      register: backup_pvc_lists
+      failed_when: false
+      changed_when: false
+
+    - name: Build discovered PVC list
+      ansible.builtin.set_fact:
+        backup_pvc_lines: "{{ backup_pvc_lines | default([]) + (item.stdout_lines | default([])) }}"
+      loop: "{{ backup_pvc_lists.results }}"
+      when: item.rc == 0
+
+    - name: Read local-path PV node affinity and host path
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - get
+          - pv
+          - "{{ item.split('\t')[2] }}"
+          - -o
+          - 'jsonpath={.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[?(@.key=="kubernetes.io/hostname")].values[0]}{"\t"}{.spec.local.path}'
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      loop: "{{ backup_pvc_lines | default([]) }}"
+      register: backup_pv_node_checks
+      when:
+        - item.split('\t') | length >= 3
+        - item.split('\t')[2] | length > 0
+      changed_when: false
+
+    - name: Build PV backup entries
+      ansible.builtin.set_fact:
+        backup_pv_entries: >-
+          {{
+            backup_pv_entries | default([])
+            + [{
+              'namespace': item.item | regex_replace('^([^\t]+)\t.*$', '\1'),
+              'pvc': item.item | regex_replace('^[^\t]+\t([^\t]+)\t.*$', '\1'),
+              'pv': item.item | regex_replace('^.*\t([^\t]+)$', '\1'),
+              'node': item.stdout | regex_replace('^([^\t]+)\t.*$', '\1'),
+              'path': item.stdout | regex_replace('^[^\t]+\t(.*)$', '\1')
+            }]
+          }}
+      loop: "{{ backup_pv_node_checks.results | default([]) }}"
+      when:
+        - item.skipped is not defined
+        - item.stdout is search('^[^\t]+\t.+$')
+
+    - name: Record PVC/PV inventory for fetched backups
+      ansible.builtin.copy:
+        dest: "{{ remote_backup_dir }}/pvc-inventory.txt"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          backup_id={{ backup_id }}
+          etcd_snapshot={{ etcd_snapshot_files.files[0].path | basename }}
+          {% for result in backup_pvc_lists.results %}
+          # {{ result.item.name }} ({{ result.item.namespace }}) rc={{ result.rc }}
+          {{ result.stdout | default('') }}
+          {% endfor %}
+          # PV node affinity
+          {% for entry in backup_pv_entries | default([]) %}
+          {{ entry.namespace }}	{{ entry.pvc }}	{{ entry.pv }}	{{ entry.node }}	{{ entry.path }}
+          {% endfor %}
+
+    - name: Create local backup directory
+      ansible.builtin.file:
+        path: "{{ local_backup_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch etcd snapshot and PVC inventory
+      ansible.builtin.fetch:
+        src: "{{ item }}"
+        dest: "{{ local_backup_dir }}/"
+        flat: true
+      loop:
+        - "{{ remote_backup_dir }}/pvc-inventory.txt"
+        - "{{ remote_backup_dir }}/{{ etcd_snapshot_files.files[0].path | basename }}"
+
+    - name: Validate fetched etcd snapshot and inventory are non-empty
+      ansible.builtin.stat:
+        path: "{{ local_backup_dir }}/{{ item | basename }}"
+      loop:
+        - "{{ remote_backup_dir }}/pvc-inventory.txt"
+        - "{{ remote_backup_dir }}/{{ etcd_snapshot_files.files[0].path | basename }}"
+      delegate_to: localhost
+      become: false
+      register: fetched_primary_backup_stats
+
+    - name: Assert fetched primary backup files are non-empty
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.size | int > 0
+        fail_msg: "Fetched primary backup file is missing or empty: {{ item.stat.path | default('unknown') }}"
+      loop: "{{ fetched_primary_backup_stats.results }}"
+
+- name: Archive and fetch local-path PV data from the nodes that own it
+  hosts: k3s_servers
+  become: true
+  vars:
+    primary_host_name: "{{ groups['k3s_primary'][0] }}"
+    backup_id: "{{ hostvars[primary_host_name].cluster_backup_id }}"
+    remote_backup_dir: "/var/lib/rancher/k3s/server/backup-captures/{{ backup_id }}"
+    local_backup_dir: "{{ hostvars[primary_host_name].cluster_local_backup_dir }}"
+    node_hostname_effective: "{{ node_hostname | default(inventory_hostname) }}"
+    node_pv_entries: >-
+      {{
+        hostvars[primary_host_name].backup_pv_entries | default([])
+        | selectattr('node', 'equalto', node_hostname_effective)
+        | list
+      }}
+  tasks:
+    - name: Ensure remote backup staging directory exists on this server
+      ansible.builtin.file:
+        path: "{{ remote_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: node_pv_entries | length > 0
+
+    - name: Archive local-path PV directories owned by this server
+      ansible.builtin.archive:
+        path: "{{ item.path }}"
+        dest: "{{ remote_backup_dir }}/pv-{{ item.namespace }}-{{ item.pvc }}-{{ item.pv }}.tar.gz"
+        format: gz
+        mode: "0600"
+      loop: "{{ node_pv_entries }}"
+      register: node_pv_archives
+      failed_when: false
+
+    - name: Fetch PV archives from this server
+      ansible.builtin.fetch:
+        src: "{{ item.dest }}"
+        dest: "{{ local_backup_dir }}/"
+        flat: true
+      loop: "{{ node_pv_archives.results | default([]) }}"
+      when: item.dest is defined
+
+    - name: Validate fetched PV archives are non-empty
+      ansible.builtin.stat:
+        path: "{{ local_backup_dir }}/{{ item.dest | basename }}"
+      loop: "{{ node_pv_archives.results | default([]) }}"
+      when: item.dest is defined
+      delegate_to: localhost
+      become: false
+      register: fetched_pv_backup_stats
+
+    - name: Assert fetched PV archives are non-empty
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.size | int > 0
+        fail_msg: "Fetched PV archive is missing or empty: {{ item.stat.path | default('unknown') }}"
+      loop: "{{ fetched_pv_backup_stats.results | default([]) }}"
+      when: item.skipped is not defined
+
+    - name: Report local backup directory
+      ansible.builtin.debug:
+        msg: "Cluster backup fetched to {{ local_backup_dir }}."
+      run_once: true

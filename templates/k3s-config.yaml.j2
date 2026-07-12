@@ -1,6 +1,15 @@
 {% if k3s_node_name is defined %}
 node-name: {{ k3s_node_name }}
 {% endif %}
+{% if k3s_node_ip is defined and k3s_node_ip %}
+node-ip: {{ k3s_node_ip }}
+{% endif %}
+{% if k3s_advertise_address is defined and k3s_advertise_address %}
+advertise-address: {{ k3s_advertise_address }}
+{% endif %}
+{% if k3s_flannel_iface is defined and k3s_flannel_iface %}
+flannel-iface: {{ k3s_flannel_iface }}
+{% endif %}
 pause-image: {{ k3s_pause_image }}
 {% if k3s_helm_job_image is defined and k3s_helm_job_image %}
 helm-job-image: {{ k3s_helm_job_image }}
@@ -14,9 +23,10 @@ server: {{ k3s_server_url }}
 {% if k3s_token is defined and k3s_token %}
 token: {{ k3s_token }}
 {% endif %}
-{% if k3s_api_tls_sans is defined %}
+{% set tls_sans_effective = (k3s_api_tls_sans | default([])) + ([k3s_vip_address] if k3s_vip_address is defined and k3s_vip_address else []) %}
+{% if tls_sans_effective | length > 0 %}
 tls-san:
-{% for san in k3s_api_tls_sans %}
+{% for san in tls_sans_effective | unique %}
   - {{ san }}
 {% endfor %}
 {% endif %}

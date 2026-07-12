@@ -1,0 +1,82 @@
+---
+# Preload the riscv64-only system images that previously blocked failover
+# when the shared registry was unavailable. This does not make the registry
+# API HA; it reduces dependence on live pulls during control-plane failover.
+- name: Preload critical riscv64 system images on every k3s server
+  hosts: k3s_servers
+  become: true
+  vars:
+    registry_host_name: "{{ groups[registry_host_group | default('riscv64_registry_host')][0] }}"
+    riscv64_registry_endpoint: "{{ hostvars[registry_host_name].ansible_facts.default_ipv4.address }}:{{ registry_node_port | default(30500) }}"
+    critical_images:
+      - name: pause
+        source_ref: "{{ riscv64_registry_endpoint }}/pause:riscv64-local"
+        cached_refs:
+          - "{{ riscv64_registry_endpoint }}/pause:riscv64-local"
+          - "pause:riscv64-local"
+      - name: klipper-helm
+        source_ref: "{{ riscv64_registry_endpoint }}/klipper-helm:riscv64-local"
+        cached_refs:
+          - "{{ riscv64_registry_endpoint }}/klipper-helm:riscv64-local"
+          - "klipper-helm:riscv64-local"
+      - name: klipper-lb
+        source_ref: "{{ riscv64_registry_endpoint }}/rancher/klipper-lb:v0.4.17"
+        cached_refs:
+          - "{{ riscv64_registry_endpoint }}/rancher/klipper-lb:v0.4.17"
+          - "docker.io/rancher/klipper-lb:v0.4.17"
+          - "rancher/klipper-lb:v0.4.17"
+      - name: metrics-server
+        source_ref: "{{ riscv64_registry_endpoint }}/rancher/mirrored-metrics-server:v0.8.1"
+        cached_refs:
+          - "{{ riscv64_registry_endpoint }}/rancher/mirrored-metrics-server:v0.8.1"
+          - "docker.io/rancher/mirrored-metrics-server:v0.8.1"
+          - "rancher/mirrored-metrics-server:v0.8.1"
+      - name: local-path-busybox
+        source_ref: "{{ riscv64_registry_endpoint }}/rancher/mirrored-library-busybox:1.37.0"
+        cached_refs:
+          - "{{ riscv64_registry_endpoint }}/rancher/mirrored-library-busybox:1.37.0"
+          - "docker.io/rancher/mirrored-library-busybox:1.37.0"
+          - "rancher/mirrored-library-busybox:1.37.0"
+  tasks:
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_facts.architecture == "riscv64"
+        fail_msg: "This playbook preloads riscv64 images and should only target riscv64 servers."
+
+    - name: Pull critical images from the shared registry into k3s containerd
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images pull --plain-http {{ item.source_ref }}
+      loop: "{{ critical_images }}"
+      register: critical_image_pulls
+      changed_when: "'unpacking' in critical_image_pulls.stdout or 'done' in critical_image_pulls.stdout"
+
+    - name: Tag critical images with every runtime reference k3s may request
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images tag {{ item.0.source_ref }} {{ item.1 }}
+      loop: "{{ critical_images | subelements('cached_refs') }}"
+      register: critical_image_tags
+      failed_when:
+        - critical_image_tags.rc != 0
+        - "'already exists' not in critical_image_tags.stderr"
+      changed_when:
+        - critical_image_tags.rc == 0
+        - "'created' in critical_image_tags.stdout or critical_image_tags.stdout == ''"
+
+    - name: List images in k3s containerd
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images ls -q
+      register: preloaded_image_refs
+      changed_when: false
+
+    - name: Assert every critical runtime image reference is cached locally
+      ansible.builtin.assert:
+        that: item in preloaded_image_refs.stdout_lines
+        fail_msg: "{{ item }} is not present in k3s containerd on {{ inventory_hostname }}."
+      loop: "{{ critical_images | map(attribute='cached_refs') | flatten }}"
+
+    - name: Report preloaded image references
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} has all critical riscv64 system image refs cached."

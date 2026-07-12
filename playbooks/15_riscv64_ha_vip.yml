@@ -1,6 +1,6 @@
 ---
 # Gives the k3s HA control plane a real floating VIP via keepalived, so
-# k3s_api_endpoint (k3s.home.arpa) survives the loss of whichever server it
+# k3s_api_endpoint survives the loss of whichever server it
 # currently points at. Repoints the existing /etc/hosts stopgap (added
 # during the initial HA join, see
 # docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md) at the VIP instead of
@@ -102,29 +102,29 @@
           k3s_vip_holder_check.stdout else 'does not hold' }} the VIP
           ({{ k3s_vip_address_effective }}).
 
-    - name: Point k3s.home.arpa at the VIP in /etc/hosts
+    - name: Point k3s_api_endpoint at the VIP in /etc/hosts
       ansible.builtin.lineinfile:
         path: /etc/hosts
-        regexp: '^\S+\s+k3s\.home\.arpa\s*$'
-        line: "{{ k3s_vip_address_effective }} k3s.home.arpa"
+        regexp: "^\\S+\\s+{{ k3s_api_endpoint | regex_escape }}\\s*$"
+        line: "{{ k3s_vip_address_effective }} {{ k3s_api_endpoint }}"
         state: present
 
-    - name: Validate k3s.home.arpa now resolves to the VIP
-      ansible.builtin.command: getent hosts k3s.home.arpa
+    - name: Validate k3s_api_endpoint now resolves to the VIP
+      ansible.builtin.command: "getent hosts {{ k3s_api_endpoint }}"
       register: k3s_vip_resolve_check
       changed_when: false
 
-    - name: Assert k3s.home.arpa resolves to the VIP address
+    - name: Assert k3s_api_endpoint resolves to the VIP address
       ansible.builtin.assert:
         that: k3s_vip_address_effective in k3s_vip_resolve_check.stdout
         fail_msg: >-
-          k3s.home.arpa resolves to
+          {{ k3s_api_endpoint }} resolves to
           '{{ k3s_vip_resolve_check.stdout }}', expected the VIP
           {{ k3s_vip_address_effective }}.
 
     - name: Validate the k3s API is reachable and authenticated via the VIP hostname
       ansible.builtin.command: >-
-        /usr/local/bin/k3s kubectl --server=https://k3s.home.arpa:6443
+        /usr/local/bin/k3s kubectl --server=https://{{ k3s_api_endpoint }}:{{ k3s_api_port | default(6443) }}
         get --raw=/readyz
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
@@ -135,7 +135,8 @@
       ansible.builtin.assert:
         that: k3s_vip_readyz_check.stdout == 'ok'
         fail_msg: >-
-          k3s kubectl --server=https://k3s.home.arpa:6443 get --raw=/readyz
+          k3s kubectl --server=https://{{ k3s_api_endpoint }}:{{ k3s_api_port | default(6443) }}
+          get --raw=/readyz
           returned '{{ k3s_vip_readyz_check.stdout }}' from
           {{ inventory_hostname }}.
 

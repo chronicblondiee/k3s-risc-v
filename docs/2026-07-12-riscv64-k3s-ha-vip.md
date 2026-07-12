@@ -28,15 +28,12 @@ all needed hand-built riscv64 workarounds; keepalived just needed
 
 - New playbook: `playbooks/15_riscv64_ha_vip.yml`, targets `k3s_servers`.
 - New template: `templates/keepalived.conf.j2`.
-- New file: `files/check-k3s-api.sh` — local-only health check
-  (`curl -k -s -o /dev/null -m 2 https://127.0.0.1:6443/readyz`), used as
-  a `vrrp_script`. Deliberately does **not** use `curl -f`: an
-  unauthenticated request to `/readyz` on this k3s build returns
-  `401 Unauthorized` even when the API server is perfectly healthy (see
-  gotcha below), so the check only distinguishes "reachable" from
-  "connection refused/timeout" — which is exactly what a VIP failover
-  trigger needs (is the local API process even listening), not full
-  content validation.
+- New file: `files/check-k3s-api.sh` — local-only authenticated health
+  check, used as a `vrrp_script`:
+  `k3s kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml --request-timeout=2s
+  get --raw=/readyz | grep -qx ok`. The VIP now follows an API server
+  that can answer a real authenticated readiness request, not merely one
+  with a listening TCP socket.
 - VIP address: `192.168.1.83` (next free address after `.80`–`.82`).
   The playbook preflight-pings it and aborts if anything answers, *unless*
   keepalived is already active locally (idempotency guard — after the
@@ -63,14 +60,13 @@ New vars (`group_vars/all/cluster.yml` / `cluster.yml.example`):
 First validation attempt used a plain `curl -k .../readyz` and asserted
 HTTP 200 — this failed consistently, even hitting `127.0.0.1:6443`
 directly on the node running k3s, unrelated to the VIP at all. This k3s
-build/config rejects fully anonymous requests to these endpoints with
-`401` rather than the "always-allow, no RBAC" behavior some kube-apiserver
-setups have. **Fixed by validating with an authenticated client instead**:
-`k3s kubectl --server=https://k3s.home.arpa:6443 get --raw=/readyz` using
-the node's own `/etc/rancher/k3s/k3s.yaml` (client-cert auth) — returns
-`ok`. This is arguably a better test anyway: it proves a real authenticated
-client can reach and use the API through the VIP hostname, which is what
-actual usage looks like.
+build/config rejects fully anonymous requests to these endpoints with `401`
+rather than the "always-allow, no RBAC" behavior some kube-apiserver setups
+have. Do not use that `401` as the keepalived success target. Both the
+local keepalived check and the VIP validation now use an authenticated
+client-cert request via `/etc/rancher/k3s/k3s.yaml` and require the body to
+be exactly `ok`. The through-VIP validation command remains
+`k3s kubectl --server=https://k3s.home.arpa:6443 get --raw=/readyz`.
 
 ## Verified failover
 

@@ -194,6 +194,9 @@
         mode: "0644"
       vars:
         k3s_node_name: "{{ node_hostname }}"
+        k3s_node_ip: "{{ ansible_host }}"
+        k3s_advertise_address: "{{ ansible_host }}"
+        k3s_flannel_iface: "{{ ansible_facts.default_ipv4.interface }}"
         k3s_cluster_init: true
       notify: restart k3s
 
@@ -296,6 +299,9 @@
         mode: "0600"
       vars:
         k3s_node_name: "{{ node_hostname }}"
+        k3s_node_ip: "{{ ansible_host }}"
+        k3s_advertise_address: "{{ ansible_host }}"
+        k3s_flannel_iface: "{{ ansible_facts.default_ipv4.interface }}"
         k3s_server_url: "https://{{ k3s_api_endpoint }}:{{ k3s_api_port | default(6443) }}"
         k3s_token: "{{ hostvars[primary_host_name].k3s_server_token }}"
       no_log: true
@@ -348,6 +354,25 @@
           - "' Ready ' in k3s_nodes.stdout"
         fail_msg: "Configured server {{ item }} is not Ready: {{ k3s_nodes.stdout }}"
       loop: "{{ groups['k3s_servers'] }}"
+
+    - name: Read each configured server's reported InternalIP
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl get node
+        {{ hostvars[item].node_hostname | default(item) }}
+        -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: k3s_internal_ip_checks
+      loop: "{{ groups['k3s_servers'] }}"
+      changed_when: false
+
+    - name: Assert each server reports the inventory address as InternalIP
+      ansible.builtin.assert:
+        that: item.stdout == hostvars[item.item].ansible_host
+        fail_msg: >-
+          {{ item.item }} reports InternalIP '{{ item.stdout }}', expected
+          inventory ansible_host '{{ hostvars[item.item].ansible_host }}'.
+      loop: "{{ k3s_internal_ip_checks.results }}"
 
     - name: List non-running kube-system pods
       ansible.builtin.command: >-

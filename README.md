@@ -3,14 +3,14 @@
 Ansible-managed home Kubernetes lab that started ARM-only, then pivoted
 toward a mixed-architecture cluster by adding riscv64 boards. The original
 arm64 board is currently offline after a hardware failure, so the active
-scope is riscv64-only: `k8s-rv2-01` plus planned `k8s-rv2-02` and
-`k8s-rv2-03` servers. Target distribution is [k3s](https://k3s.io/) across
+scope is riscv64-only: `k8s-rv2-01`, `k8s-rv2-02`, and `k8s-rv2-03`.
+Target distribution is [k3s](https://k3s.io/) across
 the cluster — chosen because it's a single static binary and, unlike
 microk8s, has a real from-source path to riscv64.
 
 The repository was formerly named `k8s-arm`; it is now `k3s-risc-v` to match
-the current k3s and RISC-V focus. The HA path is now automated for three
-riscv64 servers; mixed-architecture work remains future scope.
+the current k3s and RISC-V focus. The HA path is now live and automated for
+three riscv64 servers; mixed-architecture work remains future scope.
 
 See `AGENTS.md` for full node-by-node detail, hardware notes, and known
 gotchas (it's written for AI coding agents working in this repo, but is
@@ -23,8 +23,8 @@ specific incidents and builds.
 |---|---|---|---|---|
 | `k8s-node-01` | Orange Pi 5 Plus (RK3588) | arm64 | Armbian, vendor kernel | **Offline — hardware failure** |
 | `k8s-rv2-01` | Orange Pi RV2 | riscv64 | Armbian, nightly/trunk | Active, primary k3s server |
-| `k8s-rv2-02` | Orange Pi RV2 | riscv64 | Armbian, nightly/trunk | Planned HA server |
-| `k8s-rv2-03` | Orange Pi RV2 | riscv64 | Armbian, nightly/trunk | Planned HA server |
+| `k8s-rv2-02` | Orange Pi RV2 | riscv64 | Armbian, nightly/trunk | Active k3s server |
+| `k8s-rv2-03` | Orange Pi RV2 | riscv64 | Armbian, nightly/trunk | Active k3s server |
 
 ## Why this exists
 
@@ -69,12 +69,19 @@ playbooks/10_riscv64_local_path_busybox.yml    - durable (mirror-based) fix for 
 playbooks/11_riscv64_node_benchmark.yml        - host + in-cluster CPU/memory/storage/network benchmark for the riscv64 node
 playbooks/12_riscv64_ime_go_benchmark.yml      - copy/run the SpacemiT X60 IME Go proof and fetch benchmark reports
 playbooks/13_riscv64_llama_cpp_sidecar.yml     - build/deploy SpacemiT llama.cpp as an internal ClusterIP inference service
-playbooks/14_k3s_riscv64_ha_servers.yml        - install/reconfigure three riscv64 k3s servers with embedded etcd
-playbooks/15_riscv64_ha_vip.yml                - keepalived VIP for k3s_api_endpoint, real automatic failover
+playbooks/14_k3s_riscv64_ha_servers.yml        - install/reconfigure three riscv64 k3s servers with embedded etcd; pins node networking
+playbooks/15_riscv64_ha_vip.yml                - keepalived VIP for k3s_api_endpoint, real automatic failover, authenticated /readyz check
+playbooks/16_riscv64_preload_critical_images.yml
+                                                - preload/tag critical riscv64 system images on every server
+playbooks/17_riscv64_spread_system_workloads.yml
+                                                - scale/spread CoreDNS and Traefik across at least two nodes
+playbooks/18_riscv64_backup_cluster_state.yml   - etcd snapshot + local-path PV archive fetches to gitignored backups/
+playbooks/19_refresh_known_hosts.yml            - refresh repo-local gitignored SSH known_hosts from confirmed node addresses
 templates/                                     - Jinja2 templates rendered by the playbooks above
 files/                                         - static assets (hand-built riscv64 pause image source, generalized single-binary OCI image builder)
 tools/                                         - hardware-recovery build scripts and X60 IME Go proof tooling
 benchmarks/results/                            - fetched benchmark reports from playbooks 11/12
+backups/                                       - gitignored etcd/PV backup captures from playbook 18
 docs/                                          - incident logs / troubleshooting runbooks
 ```
 
@@ -108,14 +115,20 @@ echo 'your-chosen-vault-password' > .vault_pass && chmod 600 .vault_pass
 
 For the three-server riscv64 HA path, first create the real DNS/VIP named by
 `k3s_api_endpoint`, make sure all three RV2 boards are NVMe/SSD-rooted, then
-run `00` through `04`, `06`, `10`, `14`, and `15` in that order. `15` gives
+run `00` through `04`, `06`, `10`, `14`, `15`, `16`, `17`, and `18` in that order.
+Run `19` after board identity has been confirmed against the router's DHCP
+reservations so Ansible can keep host-key checking enabled. `15` gives
 `k3s_api_endpoint` a real `keepalived` VIP with automatic failover instead
 of relying on a single node's IP. `06` seeds the
 shared registry from the published riscv64 release artifacts before the new
 servers try to pull through it; `07`-`09` remain source-rebuild fallbacks if
-those artifacts are missing or stale. `11`-`13` are optional
-benchmarks/IME/llama.cpp workloads. See `AGENTS.md` for node-specific
-gotchas encountered along the way. Double-check
+those artifacts are missing or stale. `16` preloads the critical system image
+refs on every server so ordinary failover is less dependent on live registry
+pulls. `17` spreads only lightweight stateless kube-system workloads
+(CoreDNS and Traefik). `18` captures an etcd snapshot plus registry/LLM
+local-path PV archives into local gitignored `backups/`. `11`-`13` are
+optional benchmarks/IME/llama.cpp workloads. See `AGENTS.md` for
+node-specific gotchas encountered along the way. Double-check
 `playbooks/01_nvme_install.yml` against `docs/2026-07-07-nvme-install-brick-and-recovery.md`
 before running it — it bricked a board once here.
 
@@ -156,6 +169,10 @@ This is a home-lab proof of concept, not a hardened deployment:
 - The riscv64 registry (`playbooks/06_riscv64_registry.yml`) serves over
   plain HTTP with no auth — acceptable for a LAN-only home registry, not
   for anything internet-facing.
+- Ansible SSH host-key checking is enabled and uses a repo-local
+  gitignored `known_hosts` file. Refresh it with
+  `playbooks/19_refresh_known_hosts.yml` only after node identity has been
+  confirmed by stable MAC/DHCP reservation.
 - SSH password auth and root SSH login are disabled once
   `playbooks/03_harden_ssh.yml` has run; access after that point is
   SSH-key-only.
@@ -177,6 +194,12 @@ including which operations are treated as destructive/hard-to-reverse
   automatic failover. See `docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md`
   for the onboarding process and `docs/2026-07-12-riscv64-k3s-ha-vip.md` for
   the VIP design and failover test.
+- **Hardening follow-up applied 2026-07-13:** k3s node networking is pinned
+  to inventory addresses, keepalived uses authenticated `/readyz`, critical
+  riscv64 system images are preloaded on all three servers, CoreDNS and
+  Traefik run two spread replicas, SSH host-key checking is re-enabled, and
+  an etcd + registry/LLM local-path backup set was fetched to gitignored
+  `backups/`. See `docs/2026-07-13-riscv64-ha-hardening.md`.
 - `playbooks/06_riscv64_registry.yml` now separates the single registry host
   from registry consumers, pins the registry pod to the host node, and writes
   the same mirror-with-fallback config on all riscv64 nodes.
