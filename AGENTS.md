@@ -12,14 +12,17 @@ cluster goal is now three riscv64 k3s server nodes (`k8s-rv2-01`,
 the arm64 node and add a new x86 node, resuming the mixed-architecture goal.
 Until then, no mixed-arch work is in scope.
 
-**Status as of 2026-07-12:** `k8s-rv2-02` and `k8s-rv2-03` are physically
-online, bootstrapped (`00`), base-configured (`02`), and migrated to NVMe
-boot — see `docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md` for the
-full process and a board-identity gotcha worth reading before touching
-these nodes again (verify by NIC MAC against the router's DHCP
-reservations, not by whatever IP a board currently answers on). Still
-pending: `03`/`04`/`06`/`10` on both new boards, then the actual HA join
-via `playbooks/14_k3s_riscv64_ha_servers.yml`.
+**Status as of 2026-07-12: the three-server riscv64 HA control plane is
+live.** `k8s-rv2-02` and `k8s-rv2-03` joined `k8s-rv2-01` via
+`playbooks/14_k3s_riscv64_ha_servers.yml`; all three report `Ready` with
+`control-plane,etcd` roles. See
+`docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md` for the full process,
+a board-identity gotcha worth reading before touching these nodes again
+(verify by NIC MAC against the router's DHCP reservations, not by whatever
+IP a board currently answers on), and an important caveat: `k3s_api_endpoint`
+(`k3s.home.arpa`) doesn't yet have a real DNS/VIP record and is currently
+patched with a single-point-of-failure `/etc/hosts` entry pointing at
+`k8s-rv2-01` — fix that before relying on this cluster for real failover.
 
 ## Target k8s distribution: k3s (cluster-wide decision)
 

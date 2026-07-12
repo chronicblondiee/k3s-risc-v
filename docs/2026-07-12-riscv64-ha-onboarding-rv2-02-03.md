@@ -1,10 +1,9 @@
 # Onboarding k8s-rv2-02 and k8s-rv2-03 into the riscv64 HA control plane
 
 Brings the cluster from one riscv64 server (`k8s-rv2-01`) to the planned
-three-server embedded-etcd topology. Both new boards are now bootstrapped,
-base-configured, and migrated to NVMe boot; `03`/`04`/`06`/`10` and the
-actual HA join (`playbooks/14_k3s_riscv64_ha_servers.yml`) are still
-pending as of this writing.
+three-server embedded-etcd topology. **Complete as of 2026-07-12** —
+`playbooks/14_k3s_riscv64_ha_servers.yml` ran successfully and all three
+nodes report `Ready` with `control-plane,etcd` roles.
 
 ## Board identity: verify by MAC, not by whatever IP it currently answers on
 
@@ -66,20 +65,53 @@ a previously-used drive (Samsung `MZVLB512HAJQ-000L7`), unlike
 `k8s-rv2-02`'s fresh Fanxiang SSD. Confirmed with the user before wiping it
 that nothing on that partition was needed.
 
+## `k3s_api_endpoint` doesn't actually resolve on the LAN yet
+
+`.env`'s own comment says `k3s.home.arpa` "must resolve on the LAN (router
+DNS / Pi-hole / hosts file)" — none of those three were actually in place.
+The primary's own init doesn't need to resolve its own endpoint
+(`cluster-init: true` just binds locally), so this went unnoticed until the
+two joining servers tried to dial `https://k3s.home.arpa:6443` to fetch CA
+certs and fetch a join token, and both failed identically:
+
+```
+level=fatal msg="Error: preparing server: failed to bootstrap cluster data: failed to check if bootstrap data has been initialized: failed to validate token: failed to get CA certs: Get \"https://k3s.home.arpa:6443/cacerts\": dial tcp: lookup k3s.home.arpa: device or resource busy"
+```
+
+(`getent hosts k3s.home.arpa` returned NXDOMAIN — `rc=2` — on all three
+nodes, confirming it's a genuine missing-record issue, not a transient
+`systemd-resolved` hiccup, despite the misleading "device or resource busy"
+wording from Go's resolver.)
+
+**Fixed with a stopgap, not a permanent fix**: added a static `/etc/hosts`
+entry (`192.168.1.80 k3s.home.arpa`) on all three nodes via an ad-hoc
+`ansible ... -m lineinfile` command (not yet captured in any playbook).
+This is one of the three mechanisms the `.env` comment explicitly sanctions,
+but it's a **single point of failure**: it hardcodes the primary's IP, so if
+`k8s-rv2-01` ever goes down, `k3s.home.arpa` stops resolving even though the
+other two etcd members (`.81`/`.82`) are still healthy and could otherwise
+serve. Before relying on this cluster for real HA failover, either:
+
+- add a real DNS `A` record for `k3s.home.arpa` at the router/Pi-hole level
+  (still single-homed to whichever IP it points at, but centrally
+  changeable), or
+- stand up an actual VIP (e.g. `keepalived`) floating across all three
+  servers, and point `k3s_api_endpoint` at that instead.
+
 ## Result
 
-| Board | IP | MAC | Boot storage | Playbooks completed |
+| Board | IP | MAC | Boot storage | Role |
 |---|---|---|---|---|
-| `k8s-rv2-01` | `.80` | (primary, unchanged) | NVMe | full HA join already live |
-| `k8s-rv2-02` | `.81` | `c0:74:2b:fb:14:71` | NVMe | `00`, `02` |
-| `k8s-rv2-03` | `.82` | `c0:74:2b:fb:90:15` | NVMe | `00`, `02` |
+| `k8s-rv2-01` | `.80` | (primary, unchanged) | NVMe | control-plane, etcd (original primary) |
+| `k8s-rv2-02` | `.81` | `c0:74:2b:fb:14:71` | NVMe | control-plane, etcd (joined 2026-07-12) |
+| `k8s-rv2-03` | `.82` | `c0:74:2b:fb:90:15` | NVMe | control-plane, etcd (joined 2026-07-12) |
 
-Remaining: `03_harden_ssh.yml`, `04_k8s_node_prep.yml`,
-`06_riscv64_registry.yml`, `10_riscv64_local_path_busybox.yml` on both new
-boards, then `playbooks/14_k3s_riscv64_ha_servers.yml` for the actual
-three-server embedded-etcd join (topology is now a valid odd count of 3).
+`playbooks/14_k3s_riscv64_ha_servers.yml`'s own validation pass confirmed
+all three nodes `Ready`, no `ImagePullBackOff`/`ErrImagePull` in
+`kube-system`, and a throwaway PVC-backed pod bound and read back its data
+successfully.
 
-Also worth doing before the HA join: add explicit DHCP reservations/pool
-exclusions for `.80`–`.82` if not already fully applied on the router side
-(a pending "Apply" was visible on the reservation table mid-session) to
-prevent a repeat of the `.82` collision.
+Still worth doing: replace the `/etc/hosts` stopgap above with a real
+DNS/VIP fix, and confirm the router's DHCP reservation "Apply" was actually
+clicked/saved (a pending "Apply" was visible on the reservation table
+mid-session) to prevent a repeat of the `.82` collision.
