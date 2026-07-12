@@ -13,16 +13,18 @@ the arm64 node and add a new x86 node, resuming the mixed-architecture goal.
 Until then, no mixed-arch work is in scope.
 
 **Status as of 2026-07-12: the three-server riscv64 HA control plane is
-live.** `k8s-rv2-02` and `k8s-rv2-03` joined `k8s-rv2-01` via
-`playbooks/14_k3s_riscv64_ha_servers.yml`; all three report `Ready` with
-`control-plane,etcd` roles. See
-`docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md` for the full process,
-a board-identity gotcha worth reading before touching these nodes again
-(verify by NIC MAC against the router's DHCP reservations, not by whatever
-IP a board currently answers on), and an important caveat: `k3s_api_endpoint`
-(`k3s.home.arpa`) doesn't yet have a real DNS/VIP record and is currently
-patched with a single-point-of-failure `/etc/hosts` entry pointing at
-`k8s-rv2-01` — fix that before relying on this cluster for real failover.
+live, with a real floating VIP.** `k8s-rv2-02` and `k8s-rv2-03` joined
+`k8s-rv2-01` via `playbooks/14_k3s_riscv64_ha_servers.yml`; all three report
+`Ready` with `control-plane,etcd` roles. `k3s_api_endpoint`
+(`k3s.home.arpa`) is backed by a `keepalived` VIP (`192.168.1.83`, via
+`playbooks/15_riscv64_ha_vip.yml`) that automatically moves to a healthy
+server if the current holder goes down — verified with a live failover
+test. See `docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md` for the join
+process and a board-identity gotcha worth reading before touching these
+nodes again (verify by NIC MAC against the router's DHCP reservations, not
+by whatever IP a board currently answers on), and
+`docs/2026-07-12-riscv64-k3s-ha-vip.md` for the VIP design, the `/readyz`
+401-on-anonymous-request gotcha, and the failover test.
 
 ## Target k8s distribution: k3s (cluster-wide decision)
 
@@ -209,6 +211,7 @@ playbooks/05_k3s_riscv64_build.yml             - build+install k3s from source o
 playbooks/06_riscv64_registry.yml              - shared riscv64 OCI registry host + consumer mirror config
 playbooks/11_riscv64_node_benchmark.yml        - CPU/memory/storage/network benchmark (sysbench+fio+iperf3, host + in-cluster), riscv64-only
 playbooks/14_k3s_riscv64_ha_servers.yml        - install/reconfigure three riscv64 k3s servers with embedded etcd
+playbooks/15_riscv64_ha_vip.yml                - keepalived VIP for k3s_api_endpoint, real automatic failover
 benchmarks/results/                            - timestamped benchmark reports fetched back by playbook 11
 templates/static-ip.yaml.j2                    - netplan template for 02_base_config.yml
 templates/k3s-config.yaml.j2, k3s-registries.yaml.j2, riscv64-registry.yaml.j2

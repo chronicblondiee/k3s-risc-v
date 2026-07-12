@@ -70,6 +70,7 @@ playbooks/11_riscv64_node_benchmark.yml        - host + in-cluster CPU/memory/st
 playbooks/12_riscv64_ime_go_benchmark.yml      - copy/run the SpacemiT X60 IME Go proof and fetch benchmark reports
 playbooks/13_riscv64_llama_cpp_sidecar.yml     - build/deploy SpacemiT llama.cpp as an internal ClusterIP inference service
 playbooks/14_k3s_riscv64_ha_servers.yml        - install/reconfigure three riscv64 k3s servers with embedded etcd
+playbooks/15_riscv64_ha_vip.yml                - keepalived VIP for k3s_api_endpoint, real automatic failover
 templates/                                     - Jinja2 templates rendered by the playbooks above
 files/                                         - static assets (hand-built riscv64 pause image source, generalized single-binary OCI image builder)
 tools/                                         - hardware-recovery build scripts and X60 IME Go proof tooling
@@ -107,7 +108,9 @@ echo 'your-chosen-vault-password' > .vault_pass && chmod 600 .vault_pass
 
 For the three-server riscv64 HA path, first create the real DNS/VIP named by
 `k3s_api_endpoint`, make sure all three RV2 boards are NVMe/SSD-rooted, then
-run `00` through `04`, `06`, `10`, and `14` in that order. `06` seeds the
+run `00` through `04`, `06`, `10`, `14`, and `15` in that order. `15` gives
+`k3s_api_endpoint` a real `keepalived` VIP with automatic failover instead
+of relying on a single node's IP. `06` seeds the
 shared registry from the published riscv64 release artifacts before the new
 servers try to pull through it; `07`-`09` remain source-rebuild fallbacks if
 those artifacts are missing or stale. `11`-`13` are optional
@@ -168,13 +171,12 @@ including which operations are treated as destructive/hard-to-reverse
   mixed-architecture cluster goal after the riscv64-only HA cluster is stable.
 - **The three-server riscv64 HA control plane is live as of 2026-07-12**
   (`k8s-rv2-01`, `k8s-rv2-02`, `k8s-rv2-03`, all `Ready` with
-  `control-plane,etcd` roles) via `playbooks/14_k3s_riscv64_ha_servers.yml`.
-  See `docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md` for the full
-  onboarding process. **Caveat:** `k3s_api_endpoint` (`k3s.home.arpa`) has no
-  real DNS/VIP record yet — it's patched with a single-point-of-failure
-  `/etc/hosts` entry pointing at `k8s-rv2-01` on all three nodes. Replace
-  that with a router DNS record or a real `keepalived` VIP before relying on
-  this cluster for actual HA failover.
+  `control-plane,etcd` roles) via `playbooks/14_k3s_riscv64_ha_servers.yml`,
+  and `k3s_api_endpoint` (`k3s.home.arpa`) is backed by a real `keepalived`
+  VIP (`playbooks/15_riscv64_ha_vip.yml`, `192.168.1.83`) with verified
+  automatic failover. See `docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md`
+  for the onboarding process and `docs/2026-07-12-riscv64-k3s-ha-vip.md` for
+  the VIP design and failover test.
 - `playbooks/06_riscv64_registry.yml` now separates the single registry host
   from registry consumers, pins the registry pod to the host node, and writes
   the same mirror-with-fallback config on all riscv64 nodes.

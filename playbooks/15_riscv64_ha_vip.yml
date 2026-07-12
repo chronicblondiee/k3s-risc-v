@@ -1,0 +1,145 @@
+---
+# Gives the k3s HA control plane a real floating VIP via keepalived, so
+# k3s_api_endpoint (k3s.home.arpa) survives the loss of whichever server it
+# currently points at. Repoints the existing /etc/hosts stopgap (added
+# during the initial HA join, see
+# docs/2026-07-12-riscv64-ha-onboarding-rv2-02-03.md) at the VIP instead of
+# hardcoding the original primary's IP.
+- name: Give the k3s HA control plane a floating VIP
+  hosts: k3s_servers
+  become: true
+  vars:
+    k3s_vip_interface: "{{ ansible_facts.default_ipv4.interface }}"
+    k3s_vip_address_effective: "{{ k3s_vip_address | default('192.168.1.83') }}"
+    k3s_vip_router_id_effective: "{{ k3s_vip_router_id | default(51) }}"
+    k3s_vip_auth_pass_effective: "{{ k3s_vip_auth_pass | default('k3svip1') }}"
+    # 100 / 80 / 60 by inventory order in [k3s_servers] - large enough gaps
+    # that the health-check weight penalty (-30) always drops a degraded
+    # node below the next node's base priority, forcing a clean failover.
+    k3s_vip_priority: "{{ 100 - (groups['k3s_servers'].index(inventory_hostname) * 20) }}"
+  tasks:
+    # Idempotency guard: once this playbook has run once, the VIP is
+    # *expected* to answer (it's ours). Only run the collision preflight
+    # when keepalived isn't already active - a genuinely unclaimed address
+    # should never answer to ping at all.
+    - name: Check whether keepalived is already active on this node
+      ansible.builtin.command: systemctl is-active keepalived
+      register: k3s_vip_keepalived_active
+      failed_when: false
+      changed_when: false
+      run_once: true
+
+    - name: Abort if the VIP address is already answering on the LAN
+      ansible.builtin.command: "ping -c 2 -W 1 {{ k3s_vip_address_effective }}"
+      register: k3s_vip_preflight
+      failed_when: false
+      changed_when: false
+      run_once: true
+      when: k3s_vip_keepalived_active.stdout != 'active'
+
+    - name: Fail loudly if something already owns the VIP address
+      ansible.builtin.assert:
+        that: k3s_vip_preflight.rc != 0
+        fail_msg: >-
+          {{ k3s_vip_address_effective }} already answers to ping - pick a
+          different k3s_vip_address before proceeding, or this playbook
+          would create a live IP collision.
+      run_once: true
+      when: k3s_vip_keepalived_active.stdout != 'active'
+
+    - name: Install keepalived and curl
+      ansible.builtin.apt:
+        name:
+          - keepalived
+          - curl
+        state: present
+        update_cache: true
+
+    - name: Install the local k3s API health-check script
+      ansible.builtin.copy:
+        src: ../files/check-k3s-api.sh
+        dest: /usr/local/bin/check-k3s-api.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Template the keepalived VRRP config
+      ansible.builtin.template:
+        src: ../templates/keepalived.conf.j2
+        dest: /etc/keepalived/keepalived.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: restart keepalived
+
+    - name: Ensure keepalived is enabled and started
+      ansible.builtin.systemd:
+        name: keepalived
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Flush handlers so the VRRP config takes effect
+      ansible.builtin.meta: flush_handlers
+
+    - name: Give VRRP a moment to elect a VIP holder
+      ansible.builtin.pause:
+        seconds: 5
+      run_once: true
+
+    - name: Check whether this node currently holds the VIP
+      ansible.builtin.command: "ip -o -4 addr show {{ k3s_vip_interface }}"
+      register: k3s_vip_holder_check
+      changed_when: false
+
+    - name: Report VIP holder
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} {{ 'HOLDS' if k3s_vip_address_effective in
+          k3s_vip_holder_check.stdout else 'does not hold' }} the VIP
+          ({{ k3s_vip_address_effective }}).
+
+    - name: Point k3s.home.arpa at the VIP in /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^\S+\s+k3s\.home\.arpa\s*$'
+        line: "{{ k3s_vip_address_effective }} k3s.home.arpa"
+        state: present
+
+    - name: Validate k3s.home.arpa now resolves to the VIP
+      ansible.builtin.command: getent hosts k3s.home.arpa
+      register: k3s_vip_resolve_check
+      changed_when: false
+
+    - name: Assert k3s.home.arpa resolves to the VIP address
+      ansible.builtin.assert:
+        that: k3s_vip_address_effective in k3s_vip_resolve_check.stdout
+        fail_msg: >-
+          k3s.home.arpa resolves to
+          '{{ k3s_vip_resolve_check.stdout }}', expected the VIP
+          {{ k3s_vip_address_effective }}.
+
+    - name: Validate the k3s API is reachable and authenticated via the VIP hostname
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl --server=https://k3s.home.arpa:6443
+        get --raw=/readyz
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: k3s_vip_readyz_check
+      changed_when: false
+
+    - name: Assert the k3s API responded OK via the VIP hostname
+      ansible.builtin.assert:
+        that: k3s_vip_readyz_check.stdout == 'ok'
+        fail_msg: >-
+          k3s kubectl --server=https://k3s.home.arpa:6443 get --raw=/readyz
+          returned '{{ k3s_vip_readyz_check.stdout }}' from
+          {{ inventory_hostname }}.
+
+  handlers:
+    - name: restart keepalived
+      ansible.builtin.systemd:
+        name: keepalived
+        daemon_reload: true
+        enabled: true
+        state: restarted

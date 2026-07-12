@@ -83,20 +83,19 @@ nodes, confirming it's a genuine missing-record issue, not a transient
 `systemd-resolved` hiccup, despite the misleading "device or resource busy"
 wording from Go's resolver.)
 
-**Fixed with a stopgap, not a permanent fix**: added a static `/etc/hosts`
-entry (`192.168.1.80 k3s.home.arpa`) on all three nodes via an ad-hoc
-`ansible ... -m lineinfile` command (not yet captured in any playbook).
-This is one of the three mechanisms the `.env` comment explicitly sanctions,
-but it's a **single point of failure**: it hardcodes the primary's IP, so if
-`k8s-rv2-01` ever goes down, `k3s.home.arpa` stops resolving even though the
-other two etcd members (`.81`/`.82`) are still healthy and could otherwise
-serve. Before relying on this cluster for real HA failover, either:
+**Fixed at the time with a stopgap**: added a static `/etc/hosts` entry
+(`192.168.1.80 k3s.home.arpa`) on all three nodes via an ad-hoc
+`ansible ... -m lineinfile` command. This hardcoded the primary's IP, making
+it a single point of failure — if `k8s-rv2-01` went down, `k3s.home.arpa`
+would stop resolving even though the other two etcd members (`.81`/`.82`)
+were still healthy and could otherwise serve.
 
-- add a real DNS `A` record for `k3s.home.arpa` at the router/Pi-hole level
-  (still single-homed to whichever IP it points at, but centrally
-  changeable), or
-- stand up an actual VIP (e.g. `keepalived`) floating across all three
-  servers, and point `k3s_api_endpoint` at that instead.
+**Resolved properly the same day**: `playbooks/15_riscv64_ha_vip.yml` now
+gives the cluster a real `keepalived` VIP (`192.168.1.83`) and repoints
+this same `/etc/hosts` line at it instead — verified failover (stopped
+`keepalived` on the VIP holder, confirmed the VIP moved to the next node
+within seconds with zero manual intervention). See
+`docs/2026-07-12-riscv64-k3s-ha-vip.md` for the full design and test.
 
 ## Result
 

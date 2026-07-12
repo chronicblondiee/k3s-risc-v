@@ -9,6 +9,14 @@ k3s_api_tls_sans:
   - 192.168.1.103
   - 192.168.1.104
 
+# Floating VIP for k3s_api_endpoint, managed by playbooks/15_riscv64_ha_vip.yml.
+# k3s_vip_address must be an address outside your DHCP pool (or explicitly
+# reserved/excluded there) - the playbook preflight-pings it and refuses to
+# proceed if anything already answers.
+k3s_vip_address: 192.168.1.83
+k3s_vip_router_id: 51
+k3s_vip_auth_pass: k3svip1
+
 k3s_git_tag: v1.36.2+k3s1
 k3s_riscv64_release_repo: chronicblondiee/k3s-risc-v
 k3s_riscv64_release_tag: riscv64-v1.36.2-k3s1

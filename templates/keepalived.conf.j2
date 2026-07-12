@@ -1,0 +1,25 @@
+vrrp_script chk_k3s {
+    script "/usr/local/bin/check-k3s-api.sh"
+    interval 5
+    weight -30
+    fall 2
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    state BACKUP
+    interface {{ k3s_vip_interface }}
+    virtual_router_id {{ k3s_vip_router_id_effective }}
+    priority {{ k3s_vip_priority }}
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass {{ k3s_vip_auth_pass_effective }}
+    }
+    virtual_ipaddress {
+        {{ k3s_vip_address_effective }}/24
+    }
+    track_script {
+        chk_k3s
+    }
+}
