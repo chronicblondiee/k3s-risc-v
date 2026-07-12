@@ -110,7 +110,8 @@ all three nodes `Ready`, no `ImagePullBackOff`/`ErrImagePull` in
 `kube-system`, and a throwaway PVC-backed pod bound and read back its data
 successfully.
 
-Still worth doing: replace the `/etc/hosts` stopgap above with a real
-DNS/VIP fix, and confirm the router's DHCP reservation "Apply" was actually
-clicked/saved (a pending "Apply" was visible on the reservation table
-mid-session) to prevent a repeat of the `.82` collision.
+Both follow-ups closed out the same day: the `/etc/hosts` stopgap was
+replaced with a real `keepalived` VIP (`docs/2026-07-12-riscv64-k3s-ha-vip.md`),
+and the router's DHCP reservations for `.80`–`.83` were confirmed applied
+(`rv2-0`/`rv2-1`/`rv2-2`/`rv2-vip`, all under the `Default` scope) —
+closing the risk of a repeat `.82`-style collision.

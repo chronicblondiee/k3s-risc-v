@@ -103,6 +103,12 @@ only ARP/gratuitous-ARP for the VIP address itself uses the virtual MAC.
 
 Router-side reservation to add: **`192.168.1.83` → `00:00:5e:00:01:33`**.
 
+**Confirmed added 2026-07-12** — router's DHCP reservation table shows
+`rv2-vip` / `192.168.1.83` / `00:00:5E:00:01:33`, alongside `rv2-0`
+(`.80`), `rv2-1` (`.81`), and `rv2-2` (`.82`), all under the `Default`
+scope. Verified afterward: `k3s.home.arpa` still resolves to `192.168.1.83`
+on all three nodes, and `kubectl get nodes` shows all three `Ready`.
+
 One gotcha this introduced: the playbook's "which node holds the VIP" check
 originally looked at `ip -o -4 addr show eth1` — after `use_vmac`, the VIP
 moved to the new `vrrp.51` interface, so that check silently reported "no
@@ -113,7 +119,5 @@ filter) instead of assuming which one.
 
 ## Still outstanding
 
-Router-side: add the reservation above, and exclude/reserve `.80`–`.82`
-too if not already applied — same still-open item flagged in the
-onboarding doc. Not something this repo can do; for the user to confirm at
-the router admin UI.
+Nothing — router-side reservations for `.80`–`.83` are all confirmed in
+place (see above), closing out the last open item from the onboarding doc.
