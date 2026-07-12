@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ llama_cpp_namespace }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: llama-models
+  namespace: {{ llama_cpp_namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: {{ llama_cpp_model_storage_size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ llama_cpp_app }}
+  namespace: {{ llama_cpp_namespace }}
+spec:
+  progressDeadlineSeconds: 1800
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ llama_cpp_app }}
+  template:
+    metadata:
+      labels:
+        app: {{ llama_cpp_app }}
+    spec:
+      initContainers:
+        - name: fetch-smoke-model
+          image: {{ llama_cpp_registry_ref }}
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-ec"]
+          env:
+            - name: MODEL_URL
+              value: "{{ llama_cpp_model_url }}"
+            - name: MODEL_PATH
+              value: "{{ llama_cpp_model_path }}"
+          args:
+            - |
+              if [ ! -s "${MODEL_PATH}" ]; then
+                tmp="${MODEL_PATH}.tmp"
+                rm -f "${tmp}"
+                curl -fL --retry 3 --retry-delay 5 -o "${tmp}" "${MODEL_URL}"
+                mv "${tmp}" "${MODEL_PATH}"
+              fi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      containers:
+        - name: llama-cpp
+          image: {{ llama_cpp_registry_ref }}
+          imagePullPolicy: Always
+          env:
+            - name: SPACEMIT_MEM_BACKEND
+              value: "POSIX"
+          args:
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "{{ llama_cpp_service_port }}"
+            - "-m"
+            - "{{ llama_cpp_model_path }}"
+            - "-t"
+            - "{{ llama_cpp_threads }}"
+            - "-c"
+            - "{{ llama_cpp_ctx_size }}"
+          ports:
+            - containerPort: {{ llama_cpp_service_port }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: {{ llama_cpp_service_port }}
+            failureThreshold: 90
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ llama_cpp_service_port }}
+            periodSeconds: 10
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: llama-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ llama_cpp_app }}
+  namespace: {{ llama_cpp_namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ llama_cpp_app }}
+  ports:
+    - name: http
+      port: {{ llama_cpp_service_port }}
+      targetPort: {{ llama_cpp_service_port }}

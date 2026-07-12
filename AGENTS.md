@@ -1,8 +1,9 @@
-# k8s-arm
+# k3s-risc-v
 
 Ansible-managed home Kubernetes cluster. Started ARM-only (one node), then
 began pivoting to a **mixed-architecture** cluster by adding a RISC-V node
-alongside it. Repo/project name predates the RISC-V addition.
+alongside it. Formerly named `k8s-arm`; renamed to reflect the current k3s
+and RISC-V focus.
 
 **Current focus: riscv64-only (`k8s-rv2-01`).** The original arm64 node
 (`k8s-node-01`) is offline due to a hardware failure — see its section

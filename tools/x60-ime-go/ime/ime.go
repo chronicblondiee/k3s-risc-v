@@ -8,6 +8,7 @@ import (
 )
 
 var ErrUnavailable = errors.New("spacemit x60 ime unavailable")
+var ErrInvalidShape = errors.New("invalid matrix shape")
 
 var (
 	hasIMEOnce   sync.Once
@@ -74,6 +75,30 @@ func Accumulate4x8(dst *[16]int32, a, b *[32]byte, variant Variant) error {
 	return runKernel(dst, a, b, variant)
 }
 
+func MulMatrix(dst []int32, a, b []byte, m, n, k int, variant Variant) error {
+	if err := validVariant(variant); err != nil {
+		return err
+	}
+	if err := validMatrixArgs(dst, a, b, m, n, k); err != nil {
+		return err
+	}
+	clear(dst[:m*n])
+	return AccumulateMatrix(dst, a, b, m, n, k, variant)
+}
+
+func AccumulateMatrix(dst []int32, a, b []byte, m, n, k int, variant Variant) error {
+	if err := validVariant(variant); err != nil {
+		return err
+	}
+	if err := validMatrixArgs(dst, a, b, m, n, k); err != nil {
+		return err
+	}
+	if !HasIME() || !kernelAvailable {
+		return ErrUnavailable
+	}
+	return runMatrixKernel(dst, a, b, m, n, k, variant)
+}
+
 func ReferenceMul4x8(dst *[16]int32, a, b *[32]byte, variant Variant) error {
 	if err := validVariant(variant); err != nil {
 		return err
@@ -100,6 +125,38 @@ func ReferenceAccumulate4x8(dst *[16]int32, a, b *[32]byte, variant Variant) err
 	return nil
 }
 
+func ReferenceMulMatrix(dst []int32, a, b []byte, m, n, k int, variant Variant) error {
+	if err := validVariant(variant); err != nil {
+		return err
+	}
+	if err := validMatrixArgs(dst, a, b, m, n, k); err != nil {
+		return err
+	}
+	clear(dst[:m*n])
+	return ReferenceAccumulateMatrix(dst, a, b, m, n, k, variant)
+}
+
+func ReferenceAccumulateMatrix(dst []int32, a, b []byte, m, n, k int, variant Variant) error {
+	if err := validVariant(variant); err != nil {
+		return err
+	}
+	if err := validMatrixArgs(dst, a, b, m, n, k); err != nil {
+		return err
+	}
+	for row := 0; row < m; row++ {
+		for col := 0; col < n; col++ {
+			var sum int32
+			for kk := 0; kk < k; kk++ {
+				av := widenA(a[row*k+kk], variant)
+				bv := widenB(b[col*k+kk], variant)
+				sum += av * bv
+			}
+			dst[row*n+col] += sum
+		}
+	}
+	return nil
+}
+
 func hasIMECPUInfo(cpuinfo string) bool {
 	info := strings.ToLower(cpuinfo)
 	return strings.Contains(info, "uarch") && strings.Contains(info, "spacemit,x60") ||
@@ -113,6 +170,16 @@ func validVariant(variant Variant) error {
 	default:
 		return errors.New("unknown ime variant")
 	}
+}
+
+func validMatrixArgs(dst []int32, a, b []byte, m, n, k int) error {
+	if m <= 0 || n <= 0 || k <= 0 || m%4 != 0 || n%4 != 0 || k%8 != 0 {
+		return ErrInvalidShape
+	}
+	if m > len(a)/k || n > len(b)/k || m > len(dst)/n {
+		return ErrInvalidShape
+	}
+	return nil
 }
 
 func widenA(x byte, variant Variant) int32 {

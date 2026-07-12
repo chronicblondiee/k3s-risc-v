@@ -1,0 +1,358 @@
+---
+# Build SpacemiT's riscv64 llama.cpp runtime into the local registry and run
+# it as an internal-only Kubernetes HTTP inference sidecar. Go clients should
+# call the OpenAI-compatible llama.cpp server API over ClusterIP; IME stays
+# isolated inside this image.
+- name: Build and deploy a riscv64 SpacemiT llama.cpp HTTP sidecar
+  hosts: k8s_nodes
+  become: true
+  vars:
+    k3s_user: "{{ ansible_user }}"
+    k3s_user_home: "/home/{{ k3s_user }}"
+    registry_node_port: 30500
+    registry_endpoint: "{{ ansible_facts.default_ipv4.address }}:{{ registry_node_port }}"
+
+    llama_cpp_namespace: riscv64-llm
+    llama_cpp_app: spacemit-llama-cpp
+    llama_cpp_artifact_url: https://archive.spacemit.com/spacemit-ai/llama.cpp/spacemit-llama.cpp.riscv64.0.0.9.tar.gz
+    llama_cpp_ort_artifact_url: https://archive.spacemit.com/spacemit-ai/onnxruntime/spacemit-ort.riscv64.2.0.2.tar.gz
+    llama_cpp_build_dir: "{{ k3s_user_home }}/spacemit-llama-cpp-image"
+    llama_cpp_image_ref: "localhost/spacemit-llama-cpp:riscv64-local"
+    llama_cpp_registry_ref: "{{ registry_endpoint }}/spacemit-llama-cpp:riscv64-local"
+    llama_cpp_registry_tag: riscv64-local
+    llama_cpp_force_rebuild: false
+
+    llama_cpp_model_url: https://archive.spacemit.com/spacemit-ai/model_zoo/llm/qwen2.5-0.5b-instruct-q4_0.gguf
+    llama_cpp_model_filename: qwen2.5-0.5b-instruct-q4_0.gguf
+    llama_cpp_model_path: "/models/{{ llama_cpp_model_filename }}"
+    llama_cpp_model_storage_size: 8Gi
+    llama_cpp_threads: "4"
+    llama_cpp_ctx_size: "2048"
+    llama_cpp_service_port: 8080
+
+  tasks:
+    - name: Abort if run against a non-riscv64 host
+      ansible.builtin.assert:
+        that: ansible_facts.architecture == "riscv64"
+        fail_msg: >-
+          This playbook builds and deploys a riscv64-only SpacemiT llama.cpp
+          image. Target it explicitly, e.g. --limit k8s-rv2-01.
+
+    - name: Require k3s kubectl access
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get node --no-headers
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: node_ready_check
+      until: "'Ready' in node_ready_check.stdout"
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    - name: Require the plain-HTTP local registry mirror config
+      ansible.builtin.stat:
+        path: /etc/rancher/k3s/registries.yaml
+      register: registries_yaml
+
+    - name: Assert registries.yaml exists before pulling from the local registry
+      ansible.builtin.assert:
+        that: registries_yaml.stat.exists
+        fail_msg: >-
+          /etc/rancher/k3s/registries.yaml is missing. Run
+          playbooks/06_riscv64_registry.yml first so containerd knows the
+          {{ registry_endpoint }} registry is plain HTTP.
+
+    - name: Require the local registry API to be reachable
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/"
+        status_code: 200
+      changed_when: false
+
+    - name: Check whether the SpacemiT llama.cpp image tag is already present
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/spacemit-llama-cpp/tags/list"
+        status_code: [200, 404]
+        return_content: true
+      register: llama_cpp_registry_check
+
+    - name: Decide whether the SpacemiT llama.cpp image must be built
+      ansible.builtin.set_fact:
+        llama_cpp_build_required: >-
+          {{ (llama_cpp_force_rebuild | bool) or
+             llama_cpp_registry_check.status == 404 or
+             llama_cpp_registry_tag not in (llama_cpp_registry_check.content | default('')) }}
+
+    - name: Install buildah and its container-networking/OCI-runtime helpers
+      ansible.builtin.apt:
+        name:
+          - buildah
+          - netavark
+          - crun
+          - nftables
+        state: present
+        update_cache: true
+      when: llama_cpp_build_required | bool
+
+    - name: Create the SpacemiT llama.cpp image build directory
+      ansible.builtin.file:
+        path: "{{ llama_cpp_build_dir }}"
+        state: directory
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0755"
+      when: llama_cpp_build_required | bool
+
+    - name: Write the llama.cpp server entrypoint
+      ansible.builtin.copy:
+        dest: "{{ llama_cpp_build_dir }}/llama-entrypoint.sh"
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          set -eu
+
+          lib_paths="$(find /opt -type d -name lib | sort | paste -sd: -)"
+          if [ -n "$lib_paths" ]; then
+            export LD_LIBRARY_PATH="${lib_paths}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
+
+          candidates="/opt/spacemit-llama-cpp/llama-server /opt/spacemit-llama-cpp/server"
+          found="$(find /opt/spacemit-llama-cpp -type f \( -name llama-server -o -name server \) -perm /111 | sort || true)"
+
+          for candidate in $candidates $found; do
+            if [ -x "$candidate" ]; then
+              exec "$candidate" "$@"
+            fi
+          done
+
+          echo "No executable llama-server/server binary found in /opt/spacemit-llama-cpp" >&2
+          find /opt/spacemit-llama-cpp -maxdepth 4 -type f -printf '%m %p\n' | sort >&2
+          exit 127
+      become: false
+      when: llama_cpp_build_required | bool
+
+    - name: Write the SpacemiT llama.cpp image Dockerfile
+      ansible.builtin.copy:
+        dest: "{{ llama_cpp_build_dir }}/Dockerfile"
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0644"
+        content: |
+          FROM debian:trixie-slim
+
+          ARG LLAMA_CPP_ARTIFACT_URL
+          ARG SPACEMIT_ORT_ARTIFACT_URL
+          ENV DEBIAN_FRONTEND=noninteractive
+
+          RUN apt-get update \
+              && apt-get install -y --no-install-recommends \
+                ca-certificates \
+                curl \
+                libatomic1 \
+                libgomp1 \
+                tar \
+              && rm -rf /var/lib/apt/lists/*
+
+          WORKDIR /opt/spacemit-llama-cpp
+
+          RUN set -eux; \
+              curl -fsSL "${LLAMA_CPP_ARTIFACT_URL}" -o /tmp/spacemit-llama-cpp.tar.gz; \
+              tar -xzf /tmp/spacemit-llama-cpp.tar.gz -C /opt/spacemit-llama-cpp; \
+              rm /tmp/spacemit-llama-cpp.tar.gz; \
+              mkdir -p /opt/spacemit-ort; \
+              curl -fsSL "${SPACEMIT_ORT_ARTIFACT_URL}" -o /tmp/spacemit-ort.tar.gz; \
+              tar -xzf /tmp/spacemit-ort.tar.gz -C /opt/spacemit-ort; \
+              rm /tmp/spacemit-ort.tar.gz; \
+              server="$(find /opt/spacemit-llama-cpp -type f \( -name llama-server -o -name server \) -perm /111 | sort | head -n 1)"; \
+              test -n "${server}"; \
+              lib_paths="$(find /opt -type d -name lib | sort | paste -sd: -)"; \
+              LD_LIBRARY_PATH="${lib_paths}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ldd "${server}" | tee /tmp/llama-server.ldd; \
+              ! grep -q "not found" /tmp/llama-server.ldd
+
+          COPY llama-entrypoint.sh /usr/local/bin/llama-entrypoint.sh
+
+          EXPOSE 8080
+          ENTRYPOINT ["/usr/local/bin/llama-entrypoint.sh"]
+      become: false
+      when: llama_cpp_build_required | bool
+
+    - name: Build the SpacemiT llama.cpp image with buildah
+      ansible.builtin.command:
+        cmd: >-
+          buildah bud
+          --build-arg LLAMA_CPP_ARTIFACT_URL={{ llama_cpp_artifact_url }}
+          --build-arg SPACEMIT_ORT_ARTIFACT_URL={{ llama_cpp_ort_artifact_url }}
+          -t {{ llama_cpp_image_ref }} .
+        chdir: "{{ llama_cpp_build_dir }}"
+      when: llama_cpp_build_required | bool
+      changed_when: true
+
+    - name: Export the built image to an OCI archive
+      ansible.builtin.command:
+        cmd: >-
+          buildah push {{ llama_cpp_image_ref }}
+          oci-archive:{{ llama_cpp_build_dir }}/spacemit-llama-cpp-riscv64.oci.tar:{{ llama_cpp_image_ref }}
+      when: llama_cpp_build_required | bool
+      changed_when: true
+
+    - name: Import the image into k3s's containerd
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images import {{ llama_cpp_build_dir }}/spacemit-llama-cpp-riscv64.oci.tar
+      when: llama_cpp_build_required | bool
+      changed_when: true
+
+    - name: Tag the image for the local registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images tag {{ llama_cpp_image_ref }} {{ llama_cpp_registry_ref }}
+      when: llama_cpp_build_required | bool
+      changed_when: true
+
+    - name: Push the image into the local registry
+      ansible.builtin.command: >-
+        k3s ctr -n k8s.io --address /run/k3s/containerd/containerd.sock
+        images push --plain-http {{ llama_cpp_registry_ref }}
+      when: llama_cpp_build_required | bool
+      changed_when: true
+
+    - name: Verify the registry serves back the SpacemiT llama.cpp tag
+      ansible.builtin.uri:
+        url: "http://{{ registry_endpoint }}/v2/spacemit-llama-cpp/tags/list"
+        return_content: true
+      register: llama_cpp_registry_verify
+
+    - name: Assert the pushed tag is visible in the registry catalog
+      ansible.builtin.assert:
+        that: "llama_cpp_registry_tag in llama_cpp_registry_verify.content"
+        fail_msg: "Registry does not report the pushed llama.cpp tag: {{ llama_cpp_registry_verify.content }}"
+
+    - name: Render SpacemiT llama.cpp Kubernetes manifest
+      ansible.builtin.template:
+        src: ../templates/riscv64-llama-cpp.yaml.j2
+        dest: "{{ k3s_user_home }}/riscv64-llama-cpp.yaml"
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0644"
+      become: false
+
+    - name: Apply SpacemiT llama.cpp Kubernetes manifest
+      ansible.builtin.command: "kubectl apply -f {{ k3s_user_home }}/riscv64-llama-cpp.yaml"
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      register: llama_cpp_apply
+      changed_when: "'unchanged' not in llama_cpp_apply.stdout"
+
+    - name: Restart SpacemiT llama.cpp deployment when the stable image tag was rebuilt
+      ansible.builtin.command: >-
+        kubectl -n {{ llama_cpp_namespace }} rollout restart deployment/{{ llama_cpp_app }}
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      when: llama_cpp_build_required | bool
+      changed_when: true
+
+    - name: Wait for the model PVC to bind
+      ansible.builtin.command: >-
+        kubectl -n {{ llama_cpp_namespace }} get pvc llama-models -o jsonpath={.status.phase}
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      register: llama_cpp_pvc_check
+      until: "llama_cpp_pvc_check.stdout == 'Bound'"
+      retries: 18
+      delay: 10
+      changed_when: false
+
+    - name: Wait for SpacemiT llama.cpp deployment rollout
+      ansible.builtin.command: >-
+        kubectl -n {{ llama_cpp_namespace }} rollout status deployment/{{ llama_cpp_app }} --timeout=1800s
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      changed_when: false
+
+    - name: Delete any previous llama.cpp smoke job
+      ansible.builtin.command: >-
+        kubectl -n {{ llama_cpp_namespace }} delete job llama-cpp-smoke --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      changed_when: true
+
+    - name: Apply llama.cpp in-cluster smoke job
+      ansible.builtin.shell: |
+        kubectl -n {{ llama_cpp_namespace }} apply -f - <<'EOF'
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: llama-cpp-smoke
+        spec:
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              containers:
+                - name: smoke
+                  image: {{ llama_cpp_registry_ref }}
+                  imagePullPolicy: Always
+                  command: ["/bin/sh", "-ec"]
+                  args:
+                    - |
+                      curl -fsS http://{{ llama_cpp_app }}:{{ llama_cpp_service_port }}/health
+                      printf '\n'
+                      curl -fsS \
+                        -H 'Content-Type: application/json' \
+                        -d '{"model":"{{ llama_cpp_model_filename }}","messages":[{"role":"user","content":"Reply with one word: ok"}],"max_tokens":8,"temperature":0}' \
+                        http://{{ llama_cpp_app }}:{{ llama_cpp_service_port }}/v1/chat/completions
+                      printf '\n'
+        EOF
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      changed_when: true
+
+    - name: Wait for llama.cpp smoke job to complete
+      ansible.builtin.command: >-
+        kubectl -n {{ llama_cpp_namespace }} wait --for=condition=complete job/llama-cpp-smoke --timeout=600s
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      register: llama_cpp_smoke_wait
+      changed_when: false
+      failed_when: false
+
+    - name: Collect llama.cpp smoke job logs
+      ansible.builtin.command: >-
+        kubectl -n {{ llama_cpp_namespace }} logs job/llama-cpp-smoke
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      register: llama_cpp_smoke_logs
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the llama.cpp smoke job completed
+      ansible.builtin.assert:
+        that:
+          - llama_cpp_smoke_wait.rc == 0
+          - "'choices' in llama_cpp_smoke_logs.stdout"
+        fail_msg: >-
+          llama.cpp smoke validation failed. wait rc={{ llama_cpp_smoke_wait.rc }};
+          logs={{ llama_cpp_smoke_logs.stdout | default('') }}
+
+    - name: Report final llama.cpp pod, service, and PVC state
+      ansible.builtin.command: >-
+        kubectl -n {{ llama_cpp_namespace }} get pods,svc,pvc -o wide
+      environment:
+        KUBECONFIG: "{{ k3s_user_home }}/.kube/config"
+      become: false
+      register: llama_cpp_final_state
+      changed_when: false
+
+    - name: Show llama.cpp final state and smoke response excerpt
+      ansible.builtin.debug:
+        msg:
+          - "{{ llama_cpp_final_state.stdout_lines }}"
+          - "{{ llama_cpp_smoke_logs.stdout_lines[:12] }}"

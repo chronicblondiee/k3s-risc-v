@@ -42,6 +42,48 @@ static void x60_ime_vmadot_tile(int32_t *dst, const uint8_t *a, const uint8_t *b
 		: [dst] "r"(dst), [a] "r"(a), [b] "r"(b), [variant] "r"(variant)
 		: "memory", "t0", "v1", "v2", "v4", "v5");
 }
+
+static void x60_ime_vmadot_matrix(
+	int32_t *dst,
+	const uint8_t *a,
+	const uint8_t *b,
+	int m,
+	int n,
+	int k,
+	int variant
+) {
+	uint8_t atile[32];
+	uint8_t btile[32];
+	int32_t dtile[16];
+
+	for (int row = 0; row < m; row += 4) {
+		for (int col = 0; col < n; col += 4) {
+			for (int tr = 0; tr < 4; tr++) {
+				for (int tc = 0; tc < 4; tc++) {
+					dtile[tr * 4 + tc] = dst[(row + tr) * n + col + tc];
+				}
+			}
+			for (int kk = 0; kk < k; kk += 8) {
+				for (int tr = 0; tr < 4; tr++) {
+					for (int tk = 0; tk < 8; tk++) {
+						atile[tr * 8 + tk] = a[(row + tr) * k + kk + tk];
+					}
+				}
+				for (int tc = 0; tc < 4; tc++) {
+					for (int tk = 0; tk < 8; tk++) {
+						btile[tc * 8 + tk] = b[(col + tc) * k + kk + tk];
+					}
+				}
+				x60_ime_vmadot_tile(dtile, atile, btile, variant);
+			}
+			for (int tr = 0; tr < 4; tr++) {
+				for (int tc = 0; tc < 4; tc++) {
+					dst[(row + tr) * n + col + tc] = dtile[tr * 4 + tc];
+				}
+			}
+		}
+	}
+}
 */
 import "C"
 
@@ -52,6 +94,19 @@ func runKernel(dst *[16]int32, a, b *[32]byte, variant Variant) error {
 		(*C.int32_t)(&dst[0]),
 		(*C.uint8_t)(&a[0]),
 		(*C.uint8_t)(&b[0]),
+		C.int(variant),
+	)
+	return nil
+}
+
+func runMatrixKernel(dst []int32, a, b []byte, m, n, k int, variant Variant) error {
+	C.x60_ime_vmadot_matrix(
+		(*C.int32_t)(&dst[0]),
+		(*C.uint8_t)(&a[0]),
+		(*C.uint8_t)(&b[0]),
+		C.int(m),
+		C.int(n),
+		C.int(k),
 		C.int(variant),
 	)
 	return nil

@@ -131,6 +131,24 @@ First successful run on 2026-07-11:
   proof of execution, not a tuned throughput number, because it still crosses
   cgo once per tile.
 
+Follow-up local changes extend the proof harness from single-tile calls to
+matrix-shaped calls that loop over 4x4x8 IME tiles:
+
+- `MulMatrix` / `AccumulateMatrix` validate `m % 4 == 0`, `n % 4 == 0`, and
+  `k % 8 == 0`, clear or preserve `dst` consistently with the existing tile
+  APIs, and return `ErrInvalidShape` for bad dimensions.
+- `ReferenceMulMatrix` / `ReferenceAccumulateMatrix` provide the pure-Go
+  comparison path for the same signedness variants.
+- The riscv64+cgo kernel copies each 4x8 `A` tile and each matching 4x8 `B`
+  tile into fixed tile buffers, invokes the proven `vmadot` tile kernel, and
+  writes each 4x4 accumulator block back to the row-major destination.
+- `imebench selftest` now checks both tile correctness and matrix correctness.
+- `imebench bench` now reports dimensions, MACs/op, ns/op, ns/tile,
+  tiles/sec, and int8 MAC/s for the original 4x4x8 tile path plus larger
+  matrix shapes. The matrix path is still a proof harness, not a production
+  GEMM: it deliberately prioritizes correctness and transparent tiling over
+  avoiding temporary copies.
+
 ## Approach C — cgo against SpacemiT's own kernels
 
 SpacemiT's Bianbu toolchain forks understand IME natively, and their
@@ -149,12 +167,30 @@ registry flow playbooks 06/07/11 use — build once, push to
 Zero unsafe code in Go, plays to the repo's existing image-build machinery,
 and the IME weirdness stays quarantined in one image.
 
+**Recommended path for real LLM inference:** use
+[`playbooks/13_riscv64_llama_cpp_sidecar.yml`](../playbooks/13_riscv64_llama_cpp_sidecar.yml).
+It packages SpacemiT's pinned riscv64 llama.cpp runtime artifact into the
+local registry as `spacemit-llama-cpp:riscv64-local`, deploys it in the
+`riscv64-llm` namespace, downloads the Qwen 2.5 0.5B smoke GGUF onto a
+`local-path` PVC, and exposes only an internal ClusterIP service:
+
+```text
+http://spacemit-llama-cpp.riscv64-llm.svc.cluster.local:8080/v1/chat/completions
+```
+
+Go callers should use that OpenAI-compatible HTTP API. Do not add cgo,
+`unsafe`, or IME-specific code to ordinary Go inference clients.
+
 ## Recommendation and revisit triggers
 
-Default path is now **Approach B** via `tools/x60-ime-go`: keep it as a
-benchmark/proof tool unless a real inference workload needs more. Promote to
-Approach A only if cgo ergonomics annoy, or to C/D only if a real inference
-workload lands on the node. Worth revisiting if any of these change:
+Default path is now **Approach D** for quantized LLM inference:
+`playbooks/13_riscv64_llama_cpp_sidecar.yml` keeps vendor IME behavior inside
+SpacemiT's runtime image and gives Go code a plain HTTP boundary. Keep
+**Approach B** via `tools/x60-ime-go` as an instruction-level proof and
+benchmark harness only; it should not become the production inference path.
+Promote Approach A only if there is a concrete need for native Go IME kernels
+outside LLM serving, or Approach C only if the sidecar cannot meet an actual
+workload target. Worth revisiting if any of these change:
 
 - Go gains vendor-extension or intrinsics support (unlikely; watch
   [golang/go#61476](https://github.com/golang/go/issues/61476) descendants).
@@ -168,13 +204,24 @@ workload lands on the node. Worth revisiting if any of these change:
 
 1. Local/off-node: `go test ./...` in `tools/x60-ime-go`; `imebench detect`
    should report no IME without crashing.
-2. On `k8s-rv2-01`: run
+2. On `k8s-rv2-01`: for the IME proof harness, run
    `ansible-playbook playbooks/12_riscv64_ime_go_benchmark.yml --limit k8s-rv2-01`.
 3. Confirm the fetched Markdown and JSON report exist under
    `benchmarks/results/`.
 4. Treat the current cgo-per-tile benchmark as proof of instruction execution
    and correctness only. A real throughput study should move larger matrix
    loops across the cgo boundary and add a plain-RVV comparison.
+
+For the recommended llama.cpp sidecar path, run:
+
+```bash
+ansible-playbook playbooks/13_riscv64_llama_cpp_sidecar.yml --limit k8s-rv2-01
+```
+
+The playbook performs its own registry check, Kubernetes rollout wait, and
+in-cluster `/health` plus `/v1/chat/completions` smoke job. The validated
+runbook is
+[`docs/2026-07-12-riscv64-llama-cpp-sidecar.md`](2026-07-12-riscv64-llama-cpp-sidecar.md).
 
 ## Sources
 
